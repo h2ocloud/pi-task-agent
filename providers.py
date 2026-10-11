@@ -101,7 +101,7 @@ def _local_choice(env: dict, local_model: str, local_base: str, local_key: str) 
     }
 
 
-AUTH_ERR = re.compile(r"\b40[13]\b|unauthori[sz]|authori[sz]|authenticat|\bauth\b|oauth|access token|refresh token|invalid_grant|could not be validated", re.I)
+AUTH_ERR = re.compile(r"\b40[013]\b|unauthori[sz]|authori[sz]|authenticat|\bauth\b|oauth|access token|refresh token|invalid_grant|could not be validated|api[ _-]?key", re.I)
 TIMEOUT_ERR = re.compile(r"timed? ?out|ETIMEDOUT|deadline exceeded", re.I)
 
 

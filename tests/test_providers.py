@@ -119,6 +119,7 @@ check("clamp accepts chatgpt and rejects unknown", D.clamp({"provider": "chatgpt
 check("default provider is local (spark-main), not auto", D.DEFAULTS["provider"] == "local" and P.resolve({"XAI_API_KEY": "xai-test"}, "main", False, "spark-main", "http://127.0.0.1:9", "k")["provider"] == "local")
 check("403 before a tool call → auth fallback", P.fallback_reason("grok", "error", '403 "The OAuth2 access token could not be validated."', 0) == "auth")
 check("401 on chatgpt → auth fallback", P.fallback_reason("chatgpt", "error", "401 Unauthorized", 0) == "auth")
+check("invalid API key (xAI answers 400) → auth fallback", P.fallback_reason("grok", "error", '400 "Incorrect API key provided."', 0) == "auth")
 check("refresh token error → auth fallback", P.fallback_reason("chatgpt", "error", "refresh token was already used", 0) == "auth")
 check("timeout → timeout fallback (wall or network)", P.fallback_reason("grok", "timeout", "", 0) == "timeout" and P.fallback_reason("grok", "error", "ETIMEDOUT", 0) == "timeout")
 check("other error before a tool call falls back as error", P.fallback_reason("grok", "error", "500 upstream", 0) == "error")
