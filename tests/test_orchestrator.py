@@ -17,9 +17,9 @@ class Env:
     def send(s, chat_id, text, reply_to=None, essential=True): s.sent.append(text)
     def run_pi(s, job, sid, prompt, handle, max_rounds, wall, max_ctx=0):
         s.calls.append((sid, prompt)); return s.script(sid, prompt, len(s.calls), s)
-    def llm_json(s, system, user, max_tokens=300):
+    def llm_json(s, system, user, max_tokens=300, tier="fast"):
         s.llm_log.append(("json", system[:6], user)); return s.llm_handler(system, user)
-    def llm_text(s, system, user, max_tokens=300, timeout=90):
+    def llm_text(s, system, user, max_tokens=300, timeout=90, tier="fast", temperature=None):
         s.llm_log.append(("text", system[:6], user)); return "做好了：" + user[-60:].replace("\n", " ")
     def backend_ok(s): return s.backend
     llm_handler = staticmethod(lambda system, user: None)

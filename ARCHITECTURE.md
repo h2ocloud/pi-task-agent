@@ -55,6 +55,16 @@ Two places:
 
 Status shown to the user is one of four words: `開始了`, `還在跑`, `做完`, `被擋住`.
 
+## Two tiers, two providers
+
+`providers.resolve` picks an OpenAI-compatible base URL. `fast` is for routing and other short calls. `main` is for planning, the pi tool loop, and the final report. `PITG_PROVIDER=auto` stays on the local server while a one-token ping succeeds, and moves to Grok only when that ping fails and `XAI_API_KEY` is set. `grok` forces the subscription. The fast local alias is the same server, not a second loaded model.
+
+Grok defaults: fast `grok-4-1-fast-non-reasoning`, main `grok-build-0.1`, base `https://api.x.ai/v1`. The pi process only follows that switch after you add the provider in your own models file (`examples/pi-grok.models.json`).
+
+## Language
+
+`lang.detect` is a character heuristic so a slash command still works when the fast model is down. Model prompts end with a rule: answer in the user's language, Traditional Chinese or English, and do not default to Chinese. Chrome strings use the same choice. Stored job status stays the four Chinese words.
+
 ## Channels
 
 Telegram long-polling, optional LINE webhook. LINE spends the free reply token first. Later pushes are only the result, a block, or a question. Progress messages are not pushed. Under five pushes remaining, the other channel is used so the result is not dropped. Chat-only users get `--no-tools`.

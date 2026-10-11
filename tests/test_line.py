@@ -2,6 +2,7 @@
 """LINE 通道測試（假 LINE API，不碰網路）：驗簽、webhook 伺服器、reply token 免費路徑、推播額度節制、
 非必要訊息在 LINE 不推、輸入中動畫節流、身份對應與權限、圖片/語音/貼圖處理、markdown 轉純文字。"""
 import base64, hashlib, hmac, json, os, sys, tempfile, threading, time, urllib.request, urllib.error
+os.environ["PITG_LANG"] = "zh"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 tmp = tempfile.mkdtemp(prefix="pitg-line-test-")
 import line as L, pi_tg_bridge as B

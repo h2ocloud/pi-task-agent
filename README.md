@@ -22,6 +22,9 @@ A small local model is allowed to take longer and use more steps. The job still 
 | `skills.py` | On-demand skill selection |
 | `pirun.py` | One `pi` run: stall, loop, round cap, context cap, wall clock |
 | `line.py` | LINE webhook, free reply-token path, push quota |
+| `providers.py` | fast / main tiers, local server or Grok |
+| `lang.py` | Reply language follows the user (Traditional Chinese or English) |
+| `dashboard.py` | Loopback page for knobs, a short test prompt, and the log |
 
 Behavior worth keeping when you change it: answer before the long work, move a task to the background after two tool rounds, four status words only (`開始了` / `還在跑` / `做完` / `被擋住`). Slowness is fine. Drifting is not.
 
@@ -38,7 +41,21 @@ python3 pi_tg_bridge.py
 
 Python 3.10+. No pip packages. `pi` must be on `PATH` (or set `PI_BIN`).
 
+After start, a loopback page is at `http://127.0.0.1:8787/` (`PITG_DASH=0` turns it off). It tunes the harness, sends a short test prompt, and shows a scrubbed log. It does not load a model.
+
 Slash commands are applied directly, not by the model: `/jobs /stop /resume /new /compact /status /model /thinking /skills /help`.
+
+Replies follow the user's language. Traditional Chinese when they write Chinese, English otherwise. `PITG_LANG=zh` sets the fallback for slash commands before any message. The public default is English.
+
+## Local model, or Grok when you have none
+
+`PITG_PROVIDER=auto` uses your OpenAI-compatible server while it answers. If it does not, and `XAI_API_KEY` is set, the same calls go to xAI. `local` stays on your server. `grok` uses xAI even when the server is up.
+
+Fast calls (routing, short checks) and main calls (planning, the pi tool loop, the final report) are two tiers. On a local server they are two aliases of the one resident model. On Grok, fast is `grok-4-1-fast-non-reasoning` and main is `grok-build-0.1`. Do not load a second GPU weight to get the fast tier.
+
+The pi tool loop needs a provider block. See `examples/pi-grok.models.json`. Replace the placeholder key in your private pi config. Direct planner calls only need `XAI_API_KEY` in the env file.
+
+Measured context sizes, temperatures, and the Grok prices are in [TUNING.md](TUNING.md).
 
 ## Limits
 
@@ -54,6 +71,7 @@ python3 tests/test_orchestrator.py
 python3 tests/test_skills.py
 python3 tests/test_line.py
 python3 tests/test_bridge.py
+python3 tests/test_providers.py
 ```
 
 `tests/selftest.py` and `tests/e2e_task.py` call a real `pi` and a real model. They are not part of the offline suite.

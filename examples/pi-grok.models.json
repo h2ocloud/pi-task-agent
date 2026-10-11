@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "grok": {
+      "baseUrl": "https://api.x.ai/v1",
+      "api": "openai-completions",
+      "apiKey": "PUT_XAI_API_KEY_HERE",
+      "models": [
+        {
+          "id": "grok-4-1-fast-non-reasoning",
+          "name": "Grok fast (routing)",
+          "contextWindow": 2000000
+        },
+        {
+          "id": "grok-build-0.1",
+          "name": "Grok Build",
+          "reasoning": true,
+          "contextWindow": 256000
+        }
+      ]
+    }
+  }
+}

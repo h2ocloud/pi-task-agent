@@ -32,6 +32,8 @@ from line import LineChannel, LineClient, Router, WebhookServer
 from orchestrator import Orchestrator, TRANSIENT
 from pirun import short
 from skills import format_list, skills_for
+from lang import RULE, default_lang, detect, t
+from providers import grok_key, resolve
 
 HOME = os.path.expanduser("~")
 CFG_DIR = os.environ.get("PITG_CFG_DIR", HOME + "/.config/pi-tg-bridge")
@@ -77,9 +79,12 @@ STATUS_RE = re.compile(r"(在忙什麼|在做什麼|在忙啥|進度|做到哪|�
 STOP_RE = re.compile(r"(先停|停掉|停止|取消|別做了|不用做了|不要做了|算了)")
 
 CHAT_ONLY_PROMPT = (
-    "你是這個聊天的助理（地端模型）。只做文字聊天與一般問答，沒有任何工具，不能讀寫檔案或上網。"
-    "預設繁體中文、簡潔。不透露擁有者的私人資訊（行程、帳號、家人、伺服器等）；被問到就說這些只有擁有者本人能問。"
-    "沒做過的事不要說做完，不知道的路徑、主機、數字不要編。"
+    "You are the assistant for this chat. Text chat and general questions only. "
+    "You have no tools. You cannot read or write files or use the network. "
+    "Be brief. Do not reveal the owner's private information (schedule, accounts, family, servers). "
+    "If asked, say only the owner can ask about those. "
+    "Do not claim you finished something you did not do. Do not invent paths, hosts, or numbers. "
+    + RULE
 )
 BOT_COMMANDS = [
     {"command": "jobs", "description": "背景工作清單與進度"},
@@ -358,15 +363,82 @@ class Bridge:
     def send(self, chat_id, text, reply_to=None, essential=True):
         self.tg.send(chat_id, text, reply_to, essential=essential)
 
-    def _asr_fail(self) -> str:
-        if not self.asr:
-            return "沒有設定 ASR_URL，語音請改打字。"
-        return "語音轉文字失敗（語音服務不通？），請改打字或稍後再試。"
+    def lang_for(self, chat_id, text: str = "") -> str:
+        saved = self.state.d.setdefault("lang", {})
+        if text and not str(text).startswith("/"):
+            det = detect(text)
+            if saved.get(str(chat_id)) != det:
+                saved[str(chat_id)] = det
+                self.state.save()
+            return det
+        return saved.get(str(chat_id)) or default_lang()
+
+    def tune(self) -> dict:
+        from dashboard import DEFAULTS, apply_env, clamp, load_tune
+        path = os.environ.get("PITG_TUNE") or (STATE_DIR + "/tune.json")
+        if os.path.isfile(path):
+            data = load_tune(path)
+            apply_env(data)
+            self.env["PITG_PROVIDER"] = data["provider"]
+            return data
+        return clamp({
+            "compact_at": os.environ.get("PITG_COMPACT_AT", DEFAULTS["compact_at"]),
+            "step_ctx": os.environ.get("PITG_STEP_CTX", DEFAULTS["step_ctx"]),
+            "skill_mode": os.environ.get("PITG_SKILLS", "ondemand"),
+            "skill_limit": os.environ.get("PITG_SKILL_LIMIT", 3),
+            "tool_stall": os.environ.get("PITG_TOOL_STALL", TOOL_STALL),
+            "fg_wall": os.environ.get("PITG_FG_WALL", FG_WALL),
+            "planner_temperature": os.environ.get("PITG_PLAN_TEMP", DEFAULTS["planner_temperature"]),
+            "provider": os.environ.get("PITG_PROVIDER", "auto"),
+        })
+
+    def _local_up_now(self) -> bool:
+        now = time.time()
+        if now - getattr(self, "_ping_at", 0) < 20:
+            return bool(getattr(self, "_local_up", False))
+        self._ping_at = now
+        self._local_up = self._ping_local()
+        return self._local_up
+
+    def _ping_local(self) -> bool:
+        if not self.spark_base:
+            return False
+        try:
+            self._post_to({"base": self.spark_base, "key": self.spark_key}, "/v1/chat/completions",
+                          {"model": PRESETS.get("fast", PRESETS.get("main", "")), "max_tokens": 1,
+                           "messages": [{"role": "user", "content": "hi"}]}, 5)
+            return True
+        except Exception:
+            return False
+
+    def _endpoint(self, tier: str) -> dict:
+        data = self.tune()
+        local_model = PRESETS.get("fast" if tier == "fast" else "main", "")
+        if tier == "main":
+            local_model = self.state.alias()
+        self.env["PITG_PROVIDER"] = data["provider"]
+        return resolve(self.env, tier, self._local_up_now(), local_model, self.spark_base, self.spark_key)
+
+    def _post_to(self, ep: dict, path: str, body: dict, timeout: int):
+        headers = {"Content-Type": "application/json"}
+        if ep.get("key"):
+            headers["Authorization"] = f"Bearer {ep['key']}"
+        req = urllib.request.Request(ep["base"].rstrip("/") + path, data=json.dumps(body).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    def _asr_fail(self, chat_id=None) -> str:
+        lang = self.lang_for(chat_id) if chat_id is not None else default_lang()
+        return t(lang, "asr_unset" if not self.asr else "asr_fail")
 
     def run_pi(self, job, sid, prompt, handle, max_rounds, wall, max_ctx=0):
-        spec = pirun.Spec(self.pi, self.provider, self.state.alias(), sid, prompt, SESSIONS_DIR, DATA,
+        data = self.tune()
+        ep = self._endpoint("main")
+        provider = ep["pi_provider"] if ep["provider"] == "grok" else self.provider
+        model = ep["model"] if ep["provider"] == "grok" else self.state.alias()
+        spec = pirun.Spec(self.pi, provider, model, sid, prompt, SESSIONS_DIR, DATA,
                           skills=skills_for(prompt, SKILLS_DIR),
-                          max_rounds=max_rounds, wall=wall, stall=TOOL_STALL, max_ctx=max_ctx)
+                          max_rounds=max_rounds, wall=wall, stall=int(data["tool_stall"]), max_ctx=max_ctx)
         with self.slots:
             return pirun.run(spec, handle)
 
@@ -376,20 +448,23 @@ class Bridge:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
 
-    def llm_text(self, system: str, user: str, max_tokens: int = 300, timeout: int = 90) -> str | None:
-        """規劃/驗收/回報/分流用的一次性小呼叫（不走 pi、不帶工具）。失敗回 None，呼叫端一律退階處理。"""
-        if not self.spark_base:
+    def llm_text(self, system: str, user: str, max_tokens: int = 300, timeout: int = 90, tier: str = "fast", temperature: float | None = None) -> str | None:
+        """One short completion, no tools. fast = judgment. main = planning and the final report."""
+        ep = self._endpoint(tier)
+        if not ep.get("base"):
             return None
+        if temperature is None:
+            temperature = 0.2 if tier == "fast" else float(self.tune()["planner_temperature"])
         try:
-            d = self._post("/v1/chat/completions", {"model": PRESETS["main"], "temperature": 0.2, "max_tokens": max_tokens,
-                                                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout)
+            d = self._post_to(ep, "/v1/chat/completions", {"model": ep["model"], "temperature": temperature, "max_tokens": max_tokens,
+                                                           "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout)
             return (d["choices"][0]["message"]["content"] or "").strip()
         except Exception as e:
             log.warning("llm call failed: %s", e)
             return None
 
-    def llm_json(self, system: str, user: str, max_tokens: int = 300) -> dict | None:
-        txt = self.llm_text(system, user, max_tokens)
+    def llm_json(self, system: str, user: str, max_tokens: int = 300, tier: str = "fast") -> dict | None:
+        txt = self.llm_text(system, user, max_tokens, tier=tier)
         m = re.search(r"\{.*\}", txt or "", re.S)
         try:
             return json.loads(m.group(0)) if m else None
@@ -397,16 +472,17 @@ class Bridge:
             return None
 
     def backend_ok(self) -> bool:
-        return self.ping()[0]
+        if self._ping_local():
+            return True
+        mode = self.tune().get("provider") or "auto"
+        return mode != "local" and bool(grok_key(self.env))
 
     def ping(self):
         t0 = time.time()
-        try:
-            self._post("/v1/chat/completions", {"model": PRESETS["fast"], "max_tokens": 1,
-                                                "messages": [{"role": "user", "content": "hi"}]}, 25)
-            return True, time.time() - t0
-        except Exception:
-            return False, time.time() - t0
+        ok = self._ping_local()
+        self._local_up = ok
+        self._ping_at = time.time()
+        return ok, time.time() - t0
 
     # ------------------------------------------------------------ job views / slash commands
     def job_line(self, j: dict) -> str:
@@ -424,7 +500,7 @@ class Bridge:
         blocked = [j for j in mine if j["status"] == "被擋住" and time.time() - (j["finished"] or 0) < 7 * 86400]
         recent = [j for j in mine if j["status"] == "做完" and time.time() - (j["finished"] or 0) < 86400][-3:]
         if not (act or blocked or recent):
-            return "目前沒有背景工作。"
+            return t(self.lang_for(chat_id), "no_jobs")
         lines = []
         for title, group in (("進行中：", act), ("被擋住：", blocked), ("最近做完：", recent)):
             if group:
@@ -447,7 +523,8 @@ class Bridge:
         if cmd in ("/new", "/reset"):
             self.state.d["summary"].pop(str(chat_id), None)
             self.state.d.get("fresh", {}).pop(str(chat_id), None)
-            return f"已開新對話（{self.state.new_session(chat_id)}；舊的前情摘要也清掉了）"
+            sid = self.state.new_session(chat_id)
+            return t(self.lang_for(chat_id), "new_chat") + f" ({sid})"
         if cmd == "/compact" and is_owner:
             s = self.compact_chat(chat_id, self.state.sid(chat_id))
             return "上下文已壓縮，大方向我留著：\n" + short(s, 700)
@@ -464,7 +541,7 @@ class Bridge:
                 lines.append(self.jobs_text(chat_id))
             return "\n".join(lines)
         if not is_owner:
-            return "這個指令只有擁有者能用。" if cmd in ("/model", "/thinking", "/think", "/stop", "/skills", "/jobs", "/resume") else None
+            return t(self.lang_for(chat_id), "owner_only") if cmd in ("/model", "/thinking", "/think", "/stop", "/skills", "/jobs", "/resume") else None
         if cmd == "/jobs":
             return self.jobs_text(chat_id)
         if cmd == "/model":
@@ -568,7 +645,7 @@ class Bridge:
                     text = f"{text}\n{t}".strip() if text else t
                     self.tg.send(chat_id, f"🎤 {t}", m.get("message_id"))
                 else:
-                    self.tg.send(chat_id, self._asr_fail(), m.get("message_id"))
+                    self.tg.send(chat_id, self._asr_fail(chat_id), m.get("message_id"))
                     return
         if m.get("document"):
             d = m["document"]
@@ -626,7 +703,7 @@ class Bridge:
             p = line.download(m.get("id", ""), ".m4a")
             text = (transcribe(p, self.asr) if p else None) or ""
             if not text:
-                self.tg.send(chat_id, self._asr_fail())
+                self.tg.send(chat_id, self._asr_fail(chat_id))
                 return
         else:
             self.tg.send(chat_id, "我目前看得懂文字、圖片和語音訊息。")
@@ -674,8 +751,10 @@ class Bridge:
                 self.tg.send(chat_id, "要停哪一件？\n" + "\n".join(f"  『{x['name']}』" for x in act) + "\n回「/stop 名稱」。", msg_id)
             return True
         if len(waiting) == 1 and not act:                      # 只有一件在等答案：他的回覆多半就是答案，除非明顯無關
-            r = self.llm_json('使用者剛才被助理問了一個問題（見「待答」）。判斷這則新訊息是在回答/補充那個問題(answer)，還是無關的另一件事(other)。只輸出 JSON：{"route":"answer"} 或 {"route":"other"}',
-                              f"待答：{waiting[0]['note']}\n新訊息：{text}", 40)
+            r = self.llm_json(
+                'Judge whether the new message answers the pending question (answer) or is a different matter (other). '
+                'The user may write Chinese or English. Output one JSON object only: {"route":"answer"} or {"route":"other"}',
+                f"待答：{waiting[0]['note']}\n新訊息：{text}", 40)
             if (r or {}).get("route", "answer") == "answer":
                 self.orch.resume(waiting[0], answer=text + "".join(f"（附檔：{f}）" for f in files))
                 self.tg.send(chat_id, f"收到，我接著做『{waiting[0]['name']}』。", msg_id)
@@ -684,10 +763,10 @@ class Bridge:
         pool = act + waiting
         listing = "\n".join(f"{i + 1}. 名稱：{j['name']}｜目標：{short(j['goal'], 60)}" for i, j in enumerate(pool))
         r = self.llm_json(
-            "你是訊息分流器。使用者在對助理說話，助理目前有事情在做/在等他。判斷「新訊息」屬於哪一種，只輸出一行 JSON，不要解釋：\n"
-            '{"route":"addto","job":"<名稱>"}  ＝新訊息是在補充/修正/縮小範圍/追加要求/回答那件事\n'
-            '{"route":"other"}  ＝跟那些事無關（閒聊、問答、另一件全新的事）\n'
-            '{"route":"unclear"}  ＝可能是補充也可能是新的事，分不出來', f"進行中的事：\n{listing}\n\n新訊息：{text}", 60)
+            "Classify the new message. The user may write Chinese or English. Output one JSON object only, English keys:\n"
+            '{"route":"addto","job":"<name>"}  = it amends, narrows, or answers that job\n'
+            '{"route":"other"}  = unrelated chat, a question, or a new task\n'
+            '{"route":"unclear"}  = it might be either', f"進行中的事：\n{listing}\n\n新訊息：{text}", 60)
         route = (r or {}).get("route", "other")
         log.info("triage route=%s job=%s", route, (r or {}).get("job"))
         if route == "addto":
@@ -742,9 +821,14 @@ class Bridge:
                 if n >= PROMOTE_AT and mode == "owner":
                     return "abort"
 
-            spec = pirun.Spec(self.pi, self.provider, self.state.alias(), sid, prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
-                              files=files, mode=mode, chat_prompt=CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD, wall=FG_WALL, stall=TOOL_STALL,
-                              max_ctx=int(COMPACT_AT * 2.2))
+            knobs = self.tune()
+            ep = self._endpoint("main")
+            provider = ep["pi_provider"] if ep["provider"] == "grok" else self.provider
+            model = ep["model"] if ep["provider"] == "grok" else self.state.alias()
+            spec = pirun.Spec(self.pi, provider, model, sid, prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
+                              files=files, mode=mode, chat_prompt=CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
+                              wall=int(knobs["fg_wall"]), stall=int(knobs["tool_stall"]),
+                              max_ctx=int(float(knobs["compact_at"]) * 2.2))
             attempt, notified = 0, False
             try:
                 while True:
@@ -752,7 +836,7 @@ class Bridge:
                         r = pirun.run(spec, handle, on_round)
                     if r.kind == "error" and TRANSIENT.search(r.text) and attempt < len(RETRY_WAITS):
                         if not notified:
-                            self.tg.send(chat_id, "模型暫時連不上，我自動重試一下…", essential=False)
+                            self.tg.send(chat_id, t(self.lang_for(chat_id, text), "retry"), essential=False)
                             notified = True
                         if handle.cancel.wait(RETRY_WAITS[attempt]):
                             return
@@ -774,7 +858,7 @@ class Bridge:
                 return
             if r.kind == "final":
                 self.tg.send(chat_id, r.text, msg_id)
-                if r.ctx_tokens > COMPACT_AT:                                # 回完話之後再壓，不讓他等
+                if r.ctx_tokens > int(self.tune()["compact_at"]):             # 回完話之後再壓，不讓他等
                     self.compact_chat(chat_id, sid, r.ctx_tokens)
             elif r.kind == "error" and TRANSIENT.search(r.text):
                 self.defer(chat_id, uid, mode, text, files, msg_id)
@@ -796,7 +880,7 @@ class Bridge:
         with self.mu:
             self.deferred.append({"chat_id": chat_id, "uid": uid, "mode": mode, "text": text, "files": files, "msg_id": msg_id})
             json.dump(self.deferred, open(STATE_DIR + "/deferred.json", "w"), ensure_ascii=False)
-        self.tg.send(chat_id, "模型後端現在連不上，你這則我先記著；一恢復我就自動處理，不用重傳。", msg_id)
+        self.tg.send(chat_id, t(self.lang_for(chat_id, text), "defer"), msg_id)
 
     def _deferred_loop(self):
         while True:
@@ -861,7 +945,10 @@ class Bridge:
                     + "\n【最近幾則對話原文】\n" + self.state.d.get("recent", {}).get(str(chat_id), "") + "\n【以上為前情，下面是新訊息】\n")
             self.state.d["fresh"][str(chat_id)] = False
             self.state.save()
-        align = "對齊：只根據這則訊息、前情與工具實際看到的內容回答；沒做過的不要說做完，不知道的路徑、主機、數字不要編。\n"
+        align = (
+            "Alignment: answer only from this message, the prior context, and what tools actually returned. "
+            "Do not claim work you did not do. Do not invent paths, hosts, or numbers.\n" + RULE + "\n"
+        )
         return head + (("（" + "；".join(notes) + "）\n") if notes else "") + align + text
 
     def _typing(self, chat_id, stop):
@@ -950,6 +1037,14 @@ def main():
     except Exception:
         log.warning("setMyCommands failed (cosmetic)")
     br.recover()
+    if os.environ.get("PITG_DASH", "1") != "0":
+        from dashboard import Dashboard
+        dash = Dashboard(br, path=STATE_DIR + "/tune.json", log_path=os.environ.get("PITG_LOG", ""),
+                         port=int(os.environ.get("PITG_DASH_PORT", "8787")))
+        if dash.start():
+            log.info("dashboard http://127.0.0.1:%s/", dash.port)
+        else:
+            log.warning("dashboard did not start (port busy); bridge continues")
     log.info("bridge ready as @%s (owner=%s, chat-only=%s, groups=%s, LINE=%s)", br.username, br.owner, br.chat_only, br.groups, "on" if line_ch else "off")
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     br.run()

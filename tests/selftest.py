@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """端到端自測：假 Telegram 傳輸＋真的 pi＋真的模型後端。需要後端可用，約 5–10 分鐘。python3 tests/selftest.py"""
 import os, shutil, sys, tempfile, threading, time, logging
+os.environ.setdefault("PITG_LANG", "zh")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 tmp = tempfile.mkdtemp(prefix="pitg-e2e-")
 import pi_tg_bridge as B

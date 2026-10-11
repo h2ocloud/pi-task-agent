@@ -28,7 +28,8 @@ COMPACTOR = (
     "1. 大方向：目前在做/討論的主題與目標\n2. 已確定的結論與決定（含理由一句話）\n3. 進行中的事與下一步\n4. 還沒解決的問題\n"
     "5. 所有關鍵事實：檔案路徑、網址、ID、數字、指令名稱、錯誤訊息與已知的解法\n6. 使用者的偏好、禁忌與明確指示\n"
     "可以丟掉：寒暄、重複、已過時的嘗試過程、冗長的工具輸出。不要編造；不確定的就不要寫。\n"
-    "用繁體中文，條列，總長 {limit} 字以內。直接輸出摘要本文，不要前言。"
+    "Use the same language as the source (Traditional Chinese or English). Do not default to Chinese. "
+    "Bullet list, at most {limit} characters. Output the summary only."
 )
 
 

@@ -19,11 +19,22 @@ import time
 
 import pirun
 from context import Compactor, ungrounded
+from lang import RULE, detect, t
 from pirun import short
 
 MAX_DEPTH = 3                      # 遞迴拆小的最深層數
 STEP_ROUNDS = 14                   # 單步工具輪數上限（超過＝這步太大，拆小）
 STEP_CTX = 45000                   # 單步上下文 token 上限；超過就壓縮後接續（不算失敗）
+
+
+def _step_ctx(env) -> int:
+    tune = getattr(env, "tune", None)
+    if not callable(tune):
+        return STEP_CTX
+    try:
+        return int(tune().get("step_ctx") or STEP_CTX)
+    except Exception:
+        return STEP_CTX
 MAX_CARRIES = 3                    # 同一步最多壓縮接續幾次，再不行就拆小
 MAX_STEPS = 7
 JOB_CAP = 10800                    # 整件工作的牆鐘安全網
@@ -61,8 +72,13 @@ REPORTER = (
     "1. 先逐項對照他原本問/要的每一件事，每一項都要明確回答到，不能漏；有問「有沒有問題」就直接說有或沒有。\n"
     "2. 要具體：檔名與完整路徑、行號、數字、指令、結果內容，不要只說「已完成」。\n"
     "3. 沒做成的部分與原因要誠實說；需要他做的事（沒有就別提）放在最後一行。\n"
-    "4. 長度跟著任務走：一般事務 3–6 行；調查/分析/比較類可以到 15 行，用短條列讓手機好讀。繁體中文。"
+    "4. Match the length to the task. Say what is true. Do not claim a file or a number you did not see.\n"
+    + RULE
 )
+PLANNER += "\n" + RULE
+DECOMPOSER += "\n" + RULE
+REPLANNER += "\n" + RULE
+VERIFIER += "\n" + RULE
 STEP_PROMPT = """你正在完成一件較大的任務裡的「其中一步」。只做這一步，不要重做前面做過的事，也不要提前做後面的步驟。
 
 整體目標（原文，方向以此為準）：{goal}
@@ -82,7 +98,8 @@ STEP_PROMPT = """你正在完成一件較大的任務裡的「其中一步」。
 - 可以多花幾步。不要空轉同一個指令。
 
 做完用一到三行說明結果（含產出檔案的完整路徑）。真的做不到才開頭寫「被擋住：」並說明原因與你試過什麼；
-只有需要使用者提供資訊、授權或拍板時才寫「需要你：」。其他困難自己想辦法換做法。不要對外寄信或發訊息。"""
+只有需要使用者提供資訊、授權或拍板時才寫「需要你：」。其他困難自己想辦法換做法。不要對外寄信或發訊息。
+""" + RULE
 
 
 class Cancelled(Exception):
@@ -269,7 +286,7 @@ class Orchestrator:
                 kind, reason = r.kind, r.text or "沒有產生結果"
             if kind == "blocked" and HUMAN_RE.search(reason):
                 raise NeedHuman(step, reason)
-            hint = f"上一次沒成功：{reason}\n請換一個做法，不要重複同樣的指令。先用工具確認，再回報實際看到的路徑與結果。"
+            hint = t(detect(job.get("goal") or ""), "hint_retry", reason=reason)
         # 還是沒成 → 遞迴拆小；拆不了／已到最深 → 退階：跳過並記下原因，整件事繼續
         if depth < MAX_DEPTH:
             subs = self.decompose(job, step, reason)
@@ -289,7 +306,8 @@ class Orchestrator:
     def exec_step(self, job, steps, step, attempt, hint, ctrl):
         env = self.env
         extra = [hint] if hint else []
-        pins = ("使用者的明確要求與回答（原文，不可更動）：\n" + "\n".join(f"- {x}" for x in job["pins"][-8:]) + "\n") if job.get("pins") else ""
+        lang = detect(job.get("goal") or "")
+        pins = (t(lang, "pins", body="\n".join(f"- {x}" for x in job["pins"][-8:])) + "\n") if job.get("pins") else ""
         base = dict(goal=short(job["goal"], 400), plan=self.plan_text(job["plan"], step["id"]), pins=pins,
                     prev=job.get("digest") or "（還沒有）", title=step["title"], done=step["done_when"] or "（自行判斷合理的完成）")
         n, carries, carry = 0, 0, ""
@@ -297,10 +315,10 @@ class Orchestrator:
             remaining = JOB_CAP - (time.time() - job["started"])
             if remaining <= 0:
                 raise JobTimeout()
-            ex = list(extra) + ([f"這一步先前已做到（壓縮後的前情，請從這裡接續，不要重做）：\n{carry}"] if carry else [])
+            ex = list(extra) + ([t(detect(job.get("goal") or ""), "carry", carry=carry)] if carry else [])
             prompt = STEP_PROMPT.format(extra=("\n" + "\n".join(ex) + "\n") if ex else "", **base)
             sid = f"job-{job['id']}-{step['id'].replace('.', '_')}-{attempt}" + (f"-r{n}" if n else "")
-            r = env.run_pi(job, sid, prompt, ctrl.handle, STEP_ROUNDS, int(min(remaining, 3600)), STEP_CTX)
+            r = env.run_pi(job, sid, prompt, ctrl.handle, STEP_ROUNDS, int(min(remaining, 3600)), _step_ctx(env))
             n += 1
             if r.kind == "error" and TRANSIENT.search(r.text) and not ctrl.cancelled:
                 self.wait_backend(job, ctrl)              # 後端暫時不通：自己等，恢復後同一步重做
@@ -316,7 +334,7 @@ class Orchestrator:
         env = self.env
         if time.time() - job.get("_paused_ts", 0) > 1800:      # 離線/恢復反覆時別洗版：半小時內只說一次
             job["_paused_ts"] = time.time()
-            env.send(job["chat_id"], f"模型後端暫時連不上，我先把『{job['name']}』擱著，恢復後自己接著做，不用你管。", essential=False)
+            env.send(job["chat_id"], t(detect(job.get("goal") or ""), "backend_down", name=job["name"]), essential=False)
         while not ctrl.cancelled:
             if time.time() - job["started"] > JOB_CAP:
                 raise JobTimeout()
@@ -328,7 +346,7 @@ class Orchestrator:
         raise Cancelled()
 
     def verify(self, step, text):
-        r = self.env.llm_json(VERIFIER, f"這一步：{step['title']}\n完成標準：{step['done_when'] or '（無）'}\n回報：{short(text, 600)}", 120)
+        r = self.env.llm_json(VERIFIER, f"這一步：{step['title']}\n完成標準：{step['done_when'] or '（無）'}\n回報：{short(text, 600)}", 120, tier="main")
         if isinstance(r, dict) and r.get("ok") is False:
             return False, short(str(r.get("why", "")), 80)
         return True, ""                                   # 驗收員失效時放行：寧可信回報，不卡住
@@ -337,7 +355,7 @@ class Orchestrator:
     def make_plan(self, job, trace):
         tr = "\n".join(f"- {t['action']} → {short(t['result'], 80)}" for t in (trace or [])[:6]) or "（無）"
         sup = "；".join(job.get("pins", [])) or "（無）"
-        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n已做過的前情：\n{tr}\n補充：{sup}", 600)
+        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n已做過的前情：\n{tr}\n補充：{sup}", 600, tier="main")
         steps = parse_steps(obj)
         if not steps:                                     # 退階：規劃失敗 → 整件當一步交給遞迴機制去拆
             steps = [new_step("1", job["goal"], "任務完成並回報結果")]
@@ -353,7 +371,7 @@ class Orchestrator:
 
     def decompose(self, job, step, reason):
         obj = self.env.llm_json(DECOMPOSER, f"整體目標：{short(job['goal'], 300)}\n太大的這一步：{step['title']}\n完成標準：{step['done_when']}\n"
-                                            f"做不下去的原因：{reason}", 500)
+                                            f"做不下去的原因：{reason}", 500, tier="main")
         subs = parse_steps(obj, prefix=step["id"] + ".")
         return subs if len(subs) >= 2 else []
 
@@ -361,7 +379,7 @@ class Orchestrator:
         sup, ctrl.supplements = list(ctrl.supplements), []
         done = "\n".join(f"- {s['title']}：{short(s['result'], 80)}" for s in steps[:i] if s["status"] == "done") or "（無）"
         rest = "\n".join(f"- {s['title']}" for s in steps[i:] if s["status"] not in ("done", "skipped")) or "（無）"
-        obj = self.env.llm_json(REPLANNER, f"整體目標：{short(job['goal'], 300)}\n已完成：\n{done}\n原本還沒做的：\n{rest}\n新的補充要求：{'；'.join(sup)}", 600)
+        obj = self.env.llm_json(REPLANNER, f"整體目標：{short(job['goal'], 300)}\n已完成：\n{done}\n原本還沒做的：\n{rest}\n新的補充要求：{'；'.join(sup)}", 600, tier="main")
         new = parse_steps(obj, prefix="r")
         if not new:                                       # 退階：重排失敗 → 在最後加一步專門處理補充
             new = [new_step("r1", "處理補充要求：" + short("；".join(sup), 60), "補充要求已處理")]
@@ -395,7 +413,7 @@ class Orchestrator:
         lines = self.result_lines(plan)
         text = env.llm_text(REPORTER, f"使用者原本交代的任務（原文）：{short(job['goal'], 800)}\n"
                                       + (f"之後補充/回答的要求：{'；'.join(job.get('pins', []))}\n" if job.get("pins") else "")
-                                      + f"各部分的做法與結果：\n{short(lines, 7000)}", 900)
+                                      + f"各部分的做法與結果：\n{short(lines, 7000)}", 900, tier="main")
         if not text or len(text) < 5:
             text = lines                                  # 退階：報告員失效 → 直接給各步結果
         if done == 0:

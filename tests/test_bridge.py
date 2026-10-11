@@ -18,7 +18,7 @@ class TG:
     def typing(s, c): pass
     def flush_outbox(s): pass
 def mk(pi, jobs=None):
-    tg = TG(); br = B.Bridge(tg, {"OWNER_ID": "1", "PI_BIN": pi}, B.State(B.STATE_DIR + f"/s{time.time()}.json"), jobs or B.Jobs(B.STATE_DIR + f"/j{time.time()}.json"))
+    tg = TG(); br = B.Bridge(tg, {"OWNER_ID": "1", "PI_BIN": pi, "SPARK_ENV": "/dev/null"}, B.State(B.STATE_DIR + f"/s{time.time()}.json"), jobs or B.Jobs(B.STATE_DIR + f"/j{time.time()}.json"))
     br.backend_ok = lambda: True; return br, tg
 def wait(tg, pred, t=20):
     end = time.time() + t
@@ -34,7 +34,7 @@ cnt = f"{tmp}/c1"
 pi = fake("flaky", f'n=$(cat {cnt} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {cnt}; if [ $n -le 2 ]; then echo "fetch failed ECONNRESET" >&2; exit 1; fi; echo \'{final_ev("RECOVERED")}\'')
 br, tg = mk(pi); br.foreground(1, 1, "owner", "hi", [], 7)
 texts = [t for _, t in tg.sent]
-check("1 transient → retry → RECOVERED, notified once", texts[-1] == "RECOVERED" and sum("連不上" in t for t in texts) == 1, texts)
+check("1 transient → retry → RECOVERED, notified once", texts[-1] == "RECOVERED" and sum(("連不上" in t or "unreachable" in t) for t in texts) == 1, texts)
 
 # 2 後端持續離線 → 先記下（deferred 落檔）→ 恢復後自動處理
 pi = fake("down", 'echo "fetch failed ECONNRESET" >&2; exit 1')
@@ -75,7 +75,7 @@ check("4 first tool → human ack sent before promotion", len(tg.sent) >= 2 and 
 # 5 路由：狀態（不經模型）/ 補充 / 無關 / 分不出來→問 / 停止
 br, tg = mk(fake("noop", "true")); jobs = br.jobs
 j = jobs.add(1, "發票整理", "整理九月發票成表", "sid"); jobs.update(j, status="還在跑")
-llm_answer = {"v": {"route": "other"}}; br.llm_json = lambda s, u, m=300: llm_answer["v"]
+llm_answer = {"v": {"route": "other"}}; br.llm_json = lambda s, u, m=300, tier="fast": llm_answer["v"]
 class Orch2:
     def __init__(s): s.sup = []; s.stopped = []
     def get(s, i): return type("C", (), {"supplements": s.sup})()
