@@ -12,6 +12,7 @@ pi 會等 stdin 結束才開工，所以一律 stdin=DEVNULL。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -19,6 +20,50 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+
+log = logging.getLogger("pirun")
+
+
+_SCAN = re.compile(
+    r"(?:^|[;&|`('\"]\s*)(?:timeout\s+\d+\s*s?\s+)?(find|grep)\b([^;&|`]*)",
+    re.I,
+)
+_TARGET = re.compile(r"(?:^|\s)(~(?:/\S*)?|/\S*)")
+
+
+def broad_scan(command: str) -> bool:
+    """A find or recursive grep aimed at the whole home directory or the whole disk."""
+    if not command:
+        return False
+    for match in _SCAN.finditer(command):
+        tool, rest = match.group(1).lower(), match.group(2)
+        if tool == "grep" and not re.search(r"(?:^|\s)-[A-Za-z]*[rR]\b", rest):
+            continue
+        for raw in _TARGET.findall(rest):
+            path = raw.rstrip("/")
+            if path in {"", "/", "~", "/Users", "/home"}:
+                return True
+            if re.fullmatch(r"/(?:Users|home)/[^/]+", path):
+                return True
+    return False
+
+
+def path_hints(text: str, limit: int = 30) -> str:
+    """Paths actually present in a tool result, so a later report can cite them."""
+    found = re.findall(
+        r"(?:/(?:Users|home|tmp|opt|var|etc)(?:/[^\s,，。；;)）」`'\"]+)?|~/[^\s,，。；;)）」`'\"]+)",
+        text or "",
+    )
+    out, seen = [], set()
+    for item in found:
+        item = item.rstrip(".,;:")
+        if len(item) < 4 or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+        if len(out) >= limit:
+            break
+    return " ".join(out)
 
 
 def short(s: str, n: int) -> str:
@@ -151,21 +196,35 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
     err_buf: list[str] = []
     threading.Thread(target=lambda: err_buf.append(proc.stderr.read()), daemon=True).start()
 
-    st = {"tool_started": None, "stalls": 0, "reason": None, "t0": time.time()}
+    st = {"tool_started": None, "inflight": 0, "stalls": 0, "reason": None, "t0": time.time(), "block_scan": False}
     done = threading.Event()
+
+    def note_stall():
+        st["stalls"] += 1
+        st["tool_started"] = None
+        st["inflight"] = 0
+        st["block_scan"] = False
+        kill_children(proc.pid)                              # 只終止卡住的那個工具
+        if st["stalls"] >= 2:
+            st["reason"] = "stalled"
+            kill_tree(proc.pid)
 
     def watchdog():
         while not done.wait(2):
             now = time.time()
             if now - st["t0"] > spec.wall:
                 st["reason"] = "timeout"; kill_tree(proc.pid); return
+            if st["block_scan"] and st["inflight"]:
+                log.warning("stopping a home-wide scan")
+                note_stall()
+                if st["reason"]:
+                    return
+                continue
             ts = st["tool_started"]
-            if ts and now - ts > spec.stall:
-                st["tool_started"] = None
-                st["stalls"] += 1
-                kill_children(proc.pid)                      # 只終止卡住的那個工具
-                if st["stalls"] >= 2:
-                    st["reason"] = "stalled"; kill_tree(proc.pid); return
+            if ts and st["inflight"] and now - ts > spec.stall:
+                note_stall()
+                if st["reason"]:
+                    return
 
     threading.Thread(target=watchdog, daemon=True).start()
 
@@ -188,6 +247,16 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
         if t == "message_end" and m.get("role") == "assistant":
             text, calls = parse_content(m)
             if calls:
+                for call in calls:
+                    args = call.get("arguments") or call.get("args") or {}
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    if broad_scan(str((args or {}).get("command") or (args or {}).get("cmd") or "")):
+                        st["block_scan"] = True
+                        log.warning("home-wide scan queued")
                 h.rounds += 1
                 h.last_action = describe_call(calls[0])
                 a = calls[0].get("arguments") or calls[0].get("args") or {}
@@ -206,11 +275,21 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
             elif text:
                 final = text
         elif t == "message_end" and m.get("role") == "toolResult" and trace:
-            trace[-1]["result"] = short(parse_content(m)[0], 160)
+            full = parse_content(m)[0]
+            trace[-1]["result"] = short(full, 160)
+            hints = path_hints(full)
+            if hints:
+                trace[-1]["paths"] = hints
         elif t == "tool_execution_start":
-            st["tool_started"] = time.time()
+            st["inflight"] += 1
+            if st["tool_started"] is None:
+                st["tool_started"] = time.time()
         elif t == "tool_execution_end":
-            st["tool_started"] = None
+            if st["inflight"]:
+                st["inflight"] -= 1
+                if st["inflight"] == 0:
+                    st["tool_started"] = None
+                    st["block_scan"] = False
         elif t == "turn_end" and m.get("role") == "assistant" and m.get("stopReason") != "toolUse":
             text, _ = parse_content(m)
             if text:

@@ -18,7 +18,7 @@ class TG:
     def typing(s, c): pass
     def flush_outbox(s): pass
 def mk(pi, jobs=None):
-    tg = TG(); br = B.Bridge(tg, {"OWNER_ID": "1", "PI_BIN": pi, "SPARK_ENV": "/dev/null"}, B.State(B.STATE_DIR + f"/s{time.time()}.json"), jobs or B.Jobs(B.STATE_DIR + f"/j{time.time()}.json"))
+    tg = TG(); br = B.Bridge(tg, {"OWNER_ID": "1", "PI_BIN": pi, "SPARK_ENV": "/dev/null", "PITG_GROK_SESSION": "0"}, B.State(B.STATE_DIR + f"/s{time.time()}.json"), jobs or B.Jobs(B.STATE_DIR + f"/j{time.time()}.json"))
     br.backend_ok = lambda: True; return br, tg
 def wait(tg, pred, t=20):
     end = time.time() + t
@@ -32,7 +32,7 @@ def check(name, cond, info=""):
 # 1 暫時性錯誤：重試兩次後成功，只通知一次
 cnt = f"{tmp}/c1"
 pi = fake("flaky", f'n=$(cat {cnt} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {cnt}; if [ $n -le 2 ]; then echo "fetch failed ECONNRESET" >&2; exit 1; fi; echo \'{final_ev("RECOVERED")}\'')
-br, tg = mk(pi); br.foreground(1, 1, "owner", "hi", [], 7)
+br, tg = mk(pi); br.foreground(1, 1, "owner", "幫我看這個錯誤", [], 7)
 texts = [t for _, t in tg.sent]
 check("1 transient → retry → RECOVERED, notified once", texts[-1] == "RECOVERED" and sum(("連不上" in t or "unreachable" in t) for t in texts) == 1, texts)
 
@@ -68,9 +68,42 @@ class FakeOrch:
     def describe(s, j): return "規劃中"
     def get(s, i): return None
 br.orch = FakeOrch(); sid0 = br.state.sid(1)
+br.llm_text = lambda *a, **k: '{"say":"我先把九月的發票收成一張表。","work":true,"know":false}'
 br.foreground(1, 1, "owner", "把九月發票整理成表", [], 11)
 check("4 promoted: told user, session rotated, orchestrator got job+trace", any("多做幾步" in t for _, t in tg.sent) and br.state.sid(1) != sid0 and len(br.orch.calls) == 1 and len(br.orch.calls[0][1]) >= 2, (tg.sent, br.orch.calls))
-check("4 first tool → human ack sent before promotion", len(tg.sent) >= 2 and "把九月發票整理成表" in tg.sent[0][1] and "echo 1" in tg.sent[0][1], tg.sent[:1])
+check("4 fast model speaks first, without quoting the command", any("收成一張表" in t for _, t in tg.sent) and not any("先執行" in t or "我來處理" in t or "echo 1" in t for _, t in tg.sent), tg.sent)
+pi = fake("know", "for i in 1 2 3 4; do echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls '$i'\"}}],\"stopReason\":\"toolUse\"}}'; sleep 0.1; done; sleep 30")
+br, tg = mk(pi); br.orch = FakeOrch(); br.llm_text = lambda *a, **k: "我只看過 toolhub-publish。"
+br.foreground(1, 1, "owner", "你對於toolhubmaster 的了解到哪邊", [], 12)
+check("4b knowledge question is answered from notes, not turned into a job", any("筆記裡沒有這項" in t for _, t in tg.sent) and br.orch.calls == [] and not any("多做幾步" in t for _, t in tg.sent), tg.sent)
+pi = fake("recognize", f"echo '{final_ev('SHOULD_NOT_RUN')}'")
+br, tg = mk(pi); br.orch = FakeOrch()
+br.llm_text = lambda *a, **k: '{"say":"我來處理，先執行 ls","work":true,"know":true}'
+br.foreground(1, 1, "owner", "你認識toolhubmaster 還有我的portfolio 嗎", [], 13)
+check("4c recognition without notes does not open a search", any("不會" in t and "掃" in t for _, t in tg.sent) and br.orch.calls == [] and not any("SHOULD_NOT_RUN" in t or "先執行" in t or "我來處理" in t for _, t in tg.sent), tg.sent)
+open(B.DATA + "/brief.md", "w").write("使用者是 Howard Wu。作品集程式碼在 /tmp/proj-site。網頁是 https://example.com/works/task-agent/ 。設計筆記是 https://toolhub.example/note 。\n")
+br, tg = mk(fake("blind", f"echo '{final_ev('主模型答了')}'"))
+br.llm_text = lambda *a, **k: '{"say":"我不知道你是誰，也沒看過你的作品集。","work":false,"know":false}'
+say, work, know = br.first_words("所以你知道我是誰嗎 我的作品集網頁的程式碼在哪 還有網址", {"provider": "grok", "model": "grok-build-0.1"})
+check("4d brief answers who he is and where the page is", work is False and "Howard Wu" in say and "/tmp/proj-site" in say and "https://example.com/works/task-agent/" in say and "不知道" not in say and "我的名字是" not in say, (say, work))
+br.foreground(1, 1, "owner", "所以你知道我是誰嗎 我的作品集網頁的程式碼在哪 還有網址", [], 14)
+check("4d the brief is sent and the main model stays idle", any("Howard Wu" in t and "example.com" in t for _, t in tg.sent) and not any("主模型答了" in t or "不知道你是誰" in t for _, t in tg.sent), tg.sent)
+say, work, know = br.first_words("你是什麼模型", {"provider": "grok", "model": "grok-build-0.1"})
+check("4e model question is the real id and does not open tools", say == "我是 grok-build-0.1。" and work is False and know is False, (say, work, know))
+br.foreground(1, 1, "owner", "你是什麼模型", [], 15)
+check("4e foreground answers the resolved id and stays idle", any(t == "我是 spark-main。" for _, t in tg.sent) and not any("主模型答了" in t for _, t in tg.sent), tg.sent)
+say, work, _ = br.first_words("你認識我的 portfolio 嗎", {"provider": "grok", "model": "grok-build-0.1"})
+check("4f portfolio is answered from the brief", work is False and "/tmp/proj-site" in say and "example.com/works/task-agent" in say, (say, work))
+br.foreground(1, 1, "owner", "你好", [], 16)
+check("4g a greeting is one line and does not start the main model", any(t == "你好。" for _, t in tg.sent) and not any("主模型答了" in t for _, t in tg.sent), tg.sent)
+br.llm_text = lambda *a, **k: '{"say":"我來處理，先執行 ls","work":true,"know":false}'
+say, work, _ = br.first_words("把九月的發票收成一張表", {"provider": "grok", "model": "grok-build-0.1"})
+check("4h a canned opener is dropped", say == "" and work is True, (say, work))
+br.llm_text = lambda *a, **k: '{"say":"請把會議紀錄的內容給我，我幫你整理成三點。","work":true,"know":false}'
+say, work, _ = br.first_words("幫我把桌上的會議紀錄整理成三點", {"provider": "grok", "model": "grok-build-0.1"})
+check("4h a request for the missing text does not open tools", "三點" in say and work is False and "我來處理" not in say, (say, work))
+prompt = br.build_prompt(1, "owner", "網址呢")
+check("known facts follow the do-not-invent line", prompt.find("Do not invent") < prompt.find("可以直接說") < prompt.find("網址呢"), prompt[prompt.find("Do not"):prompt.find("網址呢")+4])
 
 # 5 路由：狀態（不經模型）/ 補充 / 無關 / 分不出來→問 / 停止
 br, tg = mk(fake("noop", "true")); jobs = br.jobs
@@ -115,6 +148,9 @@ sid = br.state.sid(1); open(f"{sess_dir}/2026_{sid}.jsonl", "w").write("\n".join
 br.llm_text = lambda system, user, max_tokens=300, timeout=90: "【大方向】專案紫色獅子\n- 資料夾 /tmp/proj-lion"
 s = br.compact_chat(1, sid, 50000)
 check("8 compaction keeps pinned facts and anchors", "紫色獅子" in s and "/tmp/proj-lion" in s, s)
+note = br.turn_model_note({"provider": "grok", "model": "grok-build-0.1"})
+check("turn note names Grok and not a hardcoded local model", "grok-build-0.1" in note and "Qwen" not in note, note)
+check("local turn note names the local id", "spark-main" in br.turn_model_note({"provider": "local", "model": "spark-main"}))
 p = br.build_prompt(1, "owner", "接著做")
 check("8 next prompt carries summary + recent verbatim, once", "前情摘要" in p and "最近幾則對話原文" in p and "閒聊7" in p and "前情摘要" not in br.build_prompt(1, "owner", "再來"), p[:200])
 br.llm_text = lambda *a, **k: None   # 壓縮模型失效 → 規則式退階仍保住錨點

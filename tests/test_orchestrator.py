@@ -157,5 +157,12 @@ def s12(sid, p, n, e):
     return Result("final", "已寫 /tmp/fake.txt", rounds=1, trace=[{"action": "執行 `ls`", "result": "ok"}])
 env = Env(s12); env.llm_handler = planner(["寫檔"]); job = mkjob(); run_job(env, job)
 check("12 ungrounded path rejected, grounded retry accepted", job["status"] == "做完" and "/tmp/real.txt" in (job["plan"][0]["result"] or "") and "/tmp/fake.txt" not in (job["plan"][0]["result"] or ""), job["plan"])
+check("planner refuses a home-directory survey", "家目錄" in O.PLANNER and "家目錄" in O.STEP_PROMPT and "家目錄" in O.DECOMPOSER)
+
+# 13 工具輸出比摘要長：路徑記在 paths 裡仍算有根據
+def s13(sid, p, n, e):
+    return Result("final", "看到 /tmp/proj/readme.md", rounds=1, trace=[{"action": "find", "result": "…", "paths": "/tmp/proj/readme.md"}])
+env = Env(s13); env.llm_handler = planner(["看目錄"]); job = mkjob(); run_job(env, job)
+check("13 path kept beside the short trace is grounded", job["status"] == "做完" and "/tmp/proj/readme.md" in (job["plan"][0]["result"] or ""), job["plan"])
 
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

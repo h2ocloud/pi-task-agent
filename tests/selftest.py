@@ -46,7 +46,7 @@ check("B direct answer = exactly one message (no ack/dispatch)", len(msgs(OWNER,
 
 # C 一輪工具：先回一句（做什麼＋第一步），再給答案
 c = len(tg.sent); upd(OWNER, "用 bash 執行 echo pitg-ok，只回答輸出內容"); wait(lambda: len(msgs(OWNER, c)) >= 2, 200); m = msgs(OWNER, c)
-check("C tool turn: ack first (what+first step) then the answer", len(m) >= 2 and "先執行" in m[0] + "先" and len(m[0]) > 6 and m[-1].strip() == "pitg-ok", m)
+check("C tool turn: opening line is not a command announcement, answer is the output", m and m[-1].strip() == "pitg-ok" and not any("先執行" in t or "我來處理" in t for t in m), m)
 
 # D 長任務（強制要 ≥3 輪工具）：放背景 → 規劃 → 小步執行 → 做完；進行中仍可聊天、可查進度
 shutil.rmtree("/tmp/pitg_e2e", ignore_errors=True)

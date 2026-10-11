@@ -87,6 +87,37 @@ _S = {
         "zh": "使用者的明確要求與回答（原文，不可更動）：\n{body}",
         "en": "User requirements, verbatim, do not rewrite:\n{body}",
     },
+    "provider_now": {
+        "zh": "接口：{mode}。{detail} Grok 登入：{signed}。ChatGPT 登入：{chatgpt}",
+        "en": "Provider: {mode}. {detail} Grok sign-in: {signed}. ChatGPT sign-in: {chatgpt}",
+    },
+    "provider_set": {
+        "zh": "已改成 {mode}。",
+        "en": "Provider is now {mode}.",
+    },
+    "provider_usage": {
+        "zh": "用法：/provider grok | chatgpt | local | auto",
+        "en": "Usage: /provider grok | chatgpt | local | auto",
+    },
+    "provider_chatgpt": {
+        "zh": "先用 ChatGPT 訂閱，失敗改用地端模型。",
+        "en": "ChatGPT subscription first. If it fails, use the local model.",
+    },
+    "provider_grok": {
+        "zh": "先用 Grok Build，失敗改用地端模型。",
+        "en": "Grok Build first. If it fails, use the local model.",
+    },
+    "provider_local": {
+        "zh": "只用地端模型。",
+        "en": "Local model only.",
+    },
+    "provider_auto": {
+        "zh": "地端在就用地端，不通才用 Grok。",
+        "en": "Local while it answers. Grok only when it does not.",
+    },
+    "grok_signed_yes": {"zh": "有", "en": "yes"},
+    "grok_signed_no": {"zh": "沒有", "en": "no"},
+    "grok_signed_dead": {"zh": "過期，要重新登入", "en": "expired, sign in again"},
 }
 
 

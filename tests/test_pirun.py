@@ -67,4 +67,17 @@ pi = fake("skills", f"printf '%s\\n' \"$@\" > {tmp}/argv; echo '{final('ok')}'")
 r = pirun.run(spec(pi, skills=[tmp + "/sk-a", tmp + "/sk-b"]), pirun.Handle())
 argv = open(f"{tmp}/argv").read().splitlines()
 check("11 --no-skills and one --skill per directory", r.kind == "final" and "--no-skills" in argv and argv.count("--skill") == 2 and (tmp + "/sk-a") in argv and (tmp + "/sk-b") in argv, argv)
+
+# 12 同時兩個工具，快的先結束：慢的那個仍要算卡死
+pi = fake("parallel", f"echo '{ev(type='tool_execution_start')}'; echo '{ev(type='tool_execution_start')}'; echo '{ev(type='tool_execution_end')}'; sleep 30 & wait $!; echo '{final('慢的也被停了')}'")
+t0 = time.time(); r = pirun.run(spec(pi, stall=3, wall=20), pirun.Handle())
+check("12 sibling end does not clear the stall timer", r.kind == "final" and r.stalls == 1 and time.time() - t0 < 12, (r.kind, r.stalls, round(time.time() - t0, 1)))
+
+# 13 掃家目錄：幾秒內中止，不必等 stall
+pi = fake("home", f"echo '{call('find /Users/howard -maxdepth 6 -name toolhub')}'; echo '{ev(type='tool_execution_start')}'; sleep 30 & wait $!; echo '{ev(type='tool_execution_end')}'; echo '{final('已改看專案目錄')}'")
+t0 = time.time(); r = pirun.run(spec(pi, stall=30, wall=20), pirun.Handle())
+check("13 home-wide find is stopped quickly", r.kind == "final" and r.stalls == 1 and time.time() - t0 < 10, (r.kind, r.stalls, round(time.time() - t0, 1)))
+check("13 project find is not a home scan", not pirun.broad_scan("find /Users/howard/Projects/app -name x") and pirun.broad_scan("grep -r foo /Users/howard") and pirun.broad_scan("bash -c 'find ~ -maxdepth 4'"))
+long = "x" * 180 + " /Users/howard/Projects/app/README.md"
+check("13 path hints keep a path past the short preview", "/Users/howard/Projects/app/README.md" in pirun.path_hints(long))
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

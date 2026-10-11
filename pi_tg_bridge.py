@@ -33,7 +33,7 @@ from orchestrator import Orchestrator, TRANSIENT
 from pirun import short
 from skills import format_list, skills_for
 from lang import RULE, default_lang, detect, t
-from providers import grok_key, resolve
+from providers import chatgpt_view, codex_body, codex_headers, codex_reply, grok_key, join_url, resolve, sync_pi_codex, sync_pi_provider
 
 HOME = os.path.expanduser("~")
 CFG_DIR = os.environ.get("PITG_CFG_DIR", HOME + "/.config/pi-tg-bridge")
@@ -77,6 +77,89 @@ def apply_presets(env: dict):
             PRESETS[k] = v
 STATUS_RE = re.compile(r"(在忙什麼|在做什麼|在忙啥|進度|做到哪|有什麼在跑|有在跑什麼|還在跑嗎|好了嗎|完成了嗎|跑到哪)")
 STOP_RE = re.compile(r"(先停|停掉|停止|取消|別做了|不用做了|不要做了|算了)")
+KNOW_RE = re.compile(r"了解到哪|了解多少|知道多少|知道些什麼|你對.{0,40}了解|你認識|認不認識")
+_MODEL_RE = re.compile(r"你是什麼模型|你是哪個模型|什麼模型|which model|what model", re.I)
+_WHO_RE = re.compile(r"我是誰|知道我是誰|who am i|who i am", re.I)
+_PORT_RE = re.compile(r"作品集|portfolio|程式碼在哪|網址", re.I)
+_NOTE_RE = re.compile(r"toolhub|設計筆記", re.I)
+_GREET_RE = re.compile(r"(你好|嗨|哈囉|在嗎|hi|hello|hey|thanks|thank you|謝謝|謝了)[!！.。?\s]*", re.I)
+
+
+def _zh(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _brief_urls(brief: str) -> list[str]:
+    return re.findall(r"https://[^\s，。]+", brief or "")
+
+
+def _brief_paths(brief: str) -> list[str]:
+    home = re.findall(r"~/[^\s，。]+", brief or "")
+    if home:
+        return home
+    out = []
+    for match in re.finditer(r"(?<![:\w])/[\w./_-]+", brief or ""):
+        path = match.group(0).rstrip("./")
+        if path.startswith("//") or len(path) < 4:
+            continue
+        out.append(path)
+    return out
+
+
+def _compose_known(text: str, brief: str, asks_who: bool, asks_port: bool, asks_note: bool) -> str:
+    """One or two sentences from the private brief. Empty when the brief has nothing for this question."""
+    if not brief:
+        return ""
+    zh = _zh(text)
+    bits = []
+    if asks_who and "Howard Wu" in brief:
+        bits.append("你是 Howard Wu。" if zh else "You are Howard Wu.")
+    paths = _brief_paths(brief)
+    urls = _brief_urls(brief)
+    if asks_port:
+        if paths:
+            bits.append(f"作品集程式在 {paths[0]}。" if zh else f"The portfolio code is at {paths[0]}.")
+        pages = [u for u in urls if "/works/" in u]
+        if pages:
+            joined = " ，".join(pages) if zh else ", ".join(pages)
+            bits.append(("網頁是 " if zh else "The page is ") + joined + ("。" if zh else "."))
+    if asks_note:
+        notes = [u for u in urls if "toolhub" in u.lower()]
+        if notes:
+            bits.append(("設計筆記是 " if zh else "The design note is ") + notes[0] + ("。" if zh else "."))
+    return "".join(bits)
+
+
+def _honest_gap(text: str) -> str:
+    if _zh(text):
+        return "筆記裡沒有這項，我不會為了這題去掃家目錄。"
+    return "That is not in the notes. I will not scan the disk for it."
+
+
+def _direct_reply(text: str, brief: str, model_id: str) -> tuple[str, bool, bool] | None:
+    """Answer from the note or the brief. None means the fast model still has to speak.
+
+    A pure greeting, the model id, and anything the brief already names do not start tools.
+    """
+    raw = (text or "").strip()
+    if model_id and _MODEL_RE.search(raw):
+        say = f"我是 {model_id}。" if _zh(raw) else f"I am {model_id}."
+        return say, False, False
+    if _GREET_RE.fullmatch(raw):
+        say = "你好。" if _zh(raw) or not re.search(r"[A-Za-z]", raw) else "Hello."
+        return say, False, False
+    asks_who = bool(_WHO_RE.search(raw))
+    asks_port = bool(_PORT_RE.search(raw))
+    asks_note = bool(_NOTE_RE.search(raw))
+    asks_know = bool(KNOW_RE.search(raw))
+    if not (asks_who or asks_port or asks_note or asks_know):
+        return None
+    say = _compose_known(raw, brief, asks_who, asks_port, asks_note)
+    if say:
+        return say, False, asks_know
+    if asks_know or asks_who or asks_port or asks_note:
+        return _honest_gap(raw), False, True
+    return None
 
 CHAT_ONLY_PROMPT = (
     "You are the assistant for this chat. Text chat and general questions only. "
@@ -94,6 +177,7 @@ BOT_COMMANDS = [
     {"command": "stop", "description": "中止目前處理或指定的背景工作"},
     {"command": "resume", "description": "接續被擋住/被停止的工作"},
     {"command": "model", "description": "查看或切換模型別名"},
+    {"command": "provider", "description": "Grok、ChatGPT 訂閱或地端，以及失敗時的退回"},
     {"command": "thinking", "description": "思考模式 on/off"},
     {"command": "skills", "description": "列出可用 skills"},
     {"command": "help", "description": "指令清單"},
@@ -107,6 +191,7 @@ HELP_TEXT = (
     "/compact  壓縮上下文，保留大方向（超過門檻我也會自己壓）\n"
     "/status  模型／思考／背景工作／後端狀態\n"
     "/model  看目前；/model list；/model <名稱> 切換\n"
+    "/provider  grok（Grok Build，失敗改用地端）| chatgpt（ChatGPT 訂閱，失敗改用地端）| local（只用地端）| auto（地端優先）\n"
     "/thinking on|off（/think）  思考模式\n"
     "/skills  可用 skills\n"
     "/help  這份清單"
@@ -419,11 +504,87 @@ class Bridge:
         self.env["PITG_PROVIDER"] = data["provider"]
         return resolve(self.env, tier, self._local_up_now(), local_model, self.spark_base, self.spark_key)
 
+    def _local_ep(self, tier: str) -> dict:
+        model = self.state.alias() if tier == "main" else PRESETS.get("fast", PRESETS.get("main", ""))
+        forced = dict(self.env)
+        forced["PITG_PROVIDER"] = "local"
+        return resolve(forced, tier, True, model, self.spark_base, self.spark_key)
+
+    def route_public(self) -> dict:
+        """What the next message will use. No keys, and no health ping."""
+        mode = (self.tune().get("provider") or "auto").lower()
+        if mode not in ("auto", "local", "grok", "chatgpt"):
+            mode = "auto"
+        signed = bool(grok_key(self.env))
+        chat = chatgpt_view(self.env)
+        local_model = self.state.alias()
+        grok_model = (self.env.get("PI_GROK_MAIN") or "grok-build-0.1").strip()
+        chatgpt_model = (self.env.get("PI_CHATGPT_MAIN") or "gpt-5.6-luna").strip()
+        if mode == "local" or (mode == "grok" and not signed) or (mode == "chatgpt" and (not chat["signed"] or chat.get("dead"))):
+            provider, model = "local", local_model
+        elif mode == "grok":
+            provider, model = "grok", grok_model
+        elif mode == "chatgpt":
+            provider, model = "chatgpt", chatgpt_model
+        else:
+            provider, model = "auto", local_model
+        return {
+            "mode": mode, "provider": provider, "model": model, "signed": signed,
+            "local_model": local_model, "grok_model": grok_model,
+            "chatgpt_model": chatgpt_model, "chatgpt_signed": chat["signed"],
+            "chatgpt_fresh": chat["fresh"], "chatgpt_dead": chat.get("dead", False),
+        }
+
+    def turn_model_note(self, ep: dict) -> str:
+        if ep.get("provider") == "grok":
+            who = f"Grok Build, model id {ep.get('model')}"
+        elif ep.get("provider") == "chatgpt":
+            who = f"ChatGPT, model id {ep.get('model')}"
+        else:
+            who = f"the local model, id {ep.get('model') or self.state.alias()}"
+        return (
+            f"This turn's model: {who}. "
+            "If asked which model you are, answer with this id. Do not claim a different model.\n"
+        )
+
+    def _provider_line(self, chat_id) -> str:
+        mode = (self.tune().get("provider") or "auto").lower()
+        lang = self.lang_for(chat_id)
+        signed = "yes" if grok_key(self.env) else "no"
+        view = chatgpt_view(self.env)
+        chat = "dead" if view.get("dead") else ("yes" if view.get("signed") else "no")
+        return t(lang, "provider_now", mode=mode, detail=t(lang, "provider_" + mode), signed=t(lang, "grok_signed_" + signed), chatgpt=t(lang, "grok_signed_" + chat))
+
+    def set_provider(self, mode: str) -> str | None:
+        mode = (mode or "").strip().lower()
+        if mode not in ("auto", "local", "grok", "chatgpt"):
+            return None
+        from dashboard import DEFAULTS, load_tune, save_tune
+        path = os.environ.get("PITG_TUNE") or (STATE_DIR + "/tune.json")
+        cur = load_tune(path) if os.path.isfile(path) else dict(DEFAULTS)
+        cur["provider"] = mode
+        save_tune(path, cur)
+        self.tune()
+        return mode
+
+    def _pi_pair(self, ep: dict) -> tuple[str, str]:
+        if ep.get("provider") == "chatgpt" and ep.get("key"):
+            sync_pi_codex(os.path.expanduser(self.env.get("PITG_PI_AUTH") or "~/.pi/agent/auth.json"), ep)
+            return ep.get("pi_provider") or "openai-codex", ep["model"]
+        if ep.get("provider") == "grok" and ep.get("key"):
+            sync_pi_provider(os.path.expanduser("~/.pi/agent/models.json"), ep["key"], ep["base"])
+            return ep["pi_provider"], ep["model"]
+        return self.provider, self.state.alias()
+
+    def _use_local_pi(self, spec) -> None:
+        spec.provider = self.provider
+        spec.alias = self.state.alias()
+
     def _post_to(self, ep: dict, path: str, body: dict, timeout: int):
         headers = {"Content-Type": "application/json"}
         if ep.get("key"):
             headers["Authorization"] = f"Bearer {ep['key']}"
-        req = urllib.request.Request(ep["base"].rstrip("/") + path, data=json.dumps(body).encode(), headers=headers)
+        req = urllib.request.Request(join_url(ep.get("base") or "", path), data=json.dumps(body).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
 
@@ -434,34 +595,79 @@ class Bridge:
     def run_pi(self, job, sid, prompt, handle, max_rounds, wall, max_ctx=0):
         data = self.tune()
         ep = self._endpoint("main")
-        provider = ep["pi_provider"] if ep["provider"] == "grok" else self.provider
-        model = ep["model"] if ep["provider"] == "grok" else self.state.alias()
-        spec = pirun.Spec(self.pi, provider, model, sid, prompt, SESSIONS_DIR, DATA,
+        provider, model = self._pi_pair(ep)
+        log.info("pi run provider=%s model=%s", provider, model)
+        spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA,
                           skills=skills_for(prompt, SKILLS_DIR),
                           max_rounds=max_rounds, wall=wall, stall=int(data["tool_stall"]), max_ctx=max_ctx)
         with self.slots:
-            return pirun.run(spec, handle)
+            result = pirun.run(spec, handle)
+        if ep.get("provider") in ("grok", "chatgpt") and result.kind == "error" and not result.rounds:
+            log.warning("%s tool run failed, using local model", ep.get("provider"))
+            self._use_local_pi(spec)
+            spec.prompt = self.turn_model_note({"provider": "local", "model": spec.alias}) + prompt
+            with self.slots:
+                return pirun.run(spec, handle)
+        return result
 
     def _post(self, path: str, body: dict, timeout: int):
-        req = urllib.request.Request(self.spark_base.rstrip("/") + path, data=json.dumps(body).encode(),
+        req = urllib.request.Request(join_url(self.spark_base, path), data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json", "Authorization": f"Bearer {self.spark_key}"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
 
-    def llm_text(self, system: str, user: str, max_tokens: int = 300, timeout: int = 90, tier: str = "fast", temperature: float | None = None) -> str | None:
-        """One short completion, no tools. fast = judgment. main = planning and the final report."""
-        ep = self._endpoint(tier)
-        if not ep.get("base"):
-            return None
-        if temperature is None:
-            temperature = 0.2 if tier == "fast" else float(self.tune()["planner_temperature"])
+    def _complete(self, ep: dict, system: str, user: str, max_tokens: int, timeout: int, temperature: float) -> tuple[str | None, str | None]:
+        if ep.get("provider") == "chatgpt":
+            return self._complete_chatgpt(ep, system, user, max_tokens, timeout)
+        if not ep.get("base") or not ep.get("model"):
+            return None, None
         try:
             d = self._post_to(ep, "/v1/chat/completions", {"model": ep["model"], "temperature": temperature, "max_tokens": max_tokens,
                                                            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout)
-            return (d["choices"][0]["message"]["content"] or "").strip()
+            reported = d.get("model") or ep.get("model")
+            return ((d["choices"][0]["message"]["content"] or "").strip() or None), reported
+        except urllib.error.HTTPError as e:
+            log.warning("llm call failed provider=%s model=%s: HTTP %s", ep.get("provider"), ep.get("model"), e.code)
+            return None, None
         except Exception as e:
-            log.warning("llm call failed: %s", e)
-            return None
+            log.warning("llm call failed provider=%s model=%s: %s", ep.get("provider"), ep.get("model"), type(e).__name__)
+            return None, None
+
+    def _complete_chatgpt(self, ep: dict, system: str, user: str, max_tokens: int, timeout: int) -> tuple[str | None, str | None]:
+        if not ep.get("base") or not ep.get("model") or not ep.get("key") or not ep.get("account"):
+            return None, None
+        body = codex_body(ep["model"], system, user, max_tokens)
+        headers = codex_headers(ep["account"], ep["key"])
+        try:
+            req = urllib.request.Request(join_url(ep["base"], "/codex/responses"), data=json.dumps(body).encode(), headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text, reported = codex_reply(r.read().decode())
+                return text, reported or ep.get("model")
+        except urllib.error.HTTPError as e:
+            log.warning("llm call failed provider=chatgpt model=%s: HTTP %s", ep.get("model"), e.code)
+            return None, None
+        except Exception as e:
+            log.warning("llm call failed provider=chatgpt model=%s: %s", ep.get("model"), type(e).__name__)
+            return None, None
+
+    def llm_turn(self, system: str, user: str, max_tokens: int = 300, timeout: int = 90, tier: str = "fast", temperature: float | None = None) -> tuple[str | None, dict]:
+        """One short completion. Returns the text and which model the endpoint reported."""
+        ep = self._endpoint(tier)
+        if temperature is None:
+            temperature = 0.2 if tier == "fast" else float(self.tune()["planner_temperature"])
+        text, reported = self._complete(ep, system, user, max_tokens, timeout, temperature)
+        used, fell = ep, False
+        if text is None and ep.get("provider") in ("grok", "chatgpt"):
+            log.warning("%s completion failed, using local model", ep.get("provider"))
+            used = self._local_ep(tier)
+            text, reported = self._complete(used, system, user, max_tokens, timeout, temperature)
+            fell = True
+        return text, {"provider": used.get("provider"), "model": reported or used.get("model"), "fell_back": fell}
+
+    def llm_text(self, system: str, user: str, max_tokens: int = 300, timeout: int = 90, tier: str = "fast", temperature: float | None = None) -> str | None:
+        """One short completion, no tools. fast = judgment. main = planning and the final report."""
+        text, _meta = self.llm_turn(system, user, max_tokens, timeout, tier, temperature)
+        return text
 
     def llm_json(self, system: str, user: str, max_tokens: int = 300, tier: str = "fast") -> dict | None:
         txt = self.llm_text(system, user, max_tokens, tier=tier)
@@ -535,13 +741,14 @@ class Bridge:
                 f"思考：{'on' if self.state.d['thinking'] else 'off'}",
                 f"session：{self.state.sid(chat_id)}（{self.session_kb(chat_id)} KB）",
                 f"後端：{'OK' if ok else '不通'}（{dt:.1f}s）" + (f"；離線期間先記下 {len(self.deferred)} 則" if self.deferred else ""),
+                self._provider_line(chat_id),
                 f"橋接：已運行 {int((time.time() - self.started) // 60)} 分鐘" + (f"；上一則：{self.last_turn}" if self.last_turn else ""),
             ]
             if is_owner:
                 lines.append(self.jobs_text(chat_id))
             return "\n".join(lines)
         if not is_owner:
-            return t(self.lang_for(chat_id), "owner_only") if cmd in ("/model", "/thinking", "/think", "/stop", "/skills", "/jobs", "/resume") else None
+            return t(self.lang_for(chat_id), "owner_only") if cmd in ("/model", "/thinking", "/think", "/stop", "/skills", "/jobs", "/resume", "/provider") else None
         if cmd == "/jobs":
             return self.jobs_text(chat_id)
         if cmd == "/model":
@@ -555,6 +762,13 @@ class Bridge:
             self.state.d["thinking"] = (arg == "think")
             self.state.save()
             return f"已切換：{arg} → {PRESETS[arg]}（下一則生效）"
+        if cmd == "/provider":
+            lang = self.lang_for(chat_id)
+            if not arg:
+                return self._provider_line(chat_id) + "\n" + t(lang, "provider_usage")
+            if not self.set_provider(arg):
+                return t(lang, "provider_usage")
+            return t(lang, "provider_set", mode=arg) + " " + t(lang, "provider_" + arg)
         if cmd in ("/thinking", "/think"):
             if arg.lower() not in ("on", "off"):
                 return f"思考：{'on' if self.state.d['thinking'] else 'off'}\n用法：/thinking on|off"
@@ -798,7 +1012,71 @@ class Bridge:
         else:
             self.tg.send(chat_id, f"『{j['name']}』目前沒在執行（{j['status']}），先 /resume 再補充。", msg_id)
 
-    # ------------------------------------------------------------ 前景一則（先回再做；超過兩輪交給 orchestrator）
+    def owner_brief(self) -> str:
+        """Private facts for this install. Missing file means nothing extra. Not a search."""
+        try:
+            text = open(os.path.join(DATA, "brief.md"), encoding="utf-8").read().strip()
+        except Exception:
+            return ""
+        return text[:1500]
+
+    def first_words(self, text: str, ep: dict) -> tuple[str, bool, bool]:
+        """Fast model speaks first. Returns (say, work, know).
+
+        work is false when the note or the private brief already answers.
+        A claim of ignorance does not count as an answer: the main model still works.
+        A down fast model means work, and no opening line.
+        """
+        brief = self.owner_brief()
+        direct = _direct_reply(text or "", brief, str(ep.get("model") or ""))
+        if direct:
+            return direct
+        raw = self.llm_text(
+            "You judge one message and speak first. A stronger model does the work only if you say so.\n"
+            "Output one JSON object only: {\"say\":\"...\",\"work\":false,\"know\":false}\n"
+            "work is false for a greeting, thanks, which model you are, or anything the note and the known-facts block already answer.\n"
+            "work is true when they want something done that the known facts do not answer.\n"
+            "know is true when they ask what you know or whether you recognize a project.\n"
+            "say is one or two sentences in the user's language. Sound like a person. "
+            "If they asked which model, state the id from the note. "
+            "If they ask who they are, or where a project or page is, answer from the known-facts block, including its path and URL. "
+            "Never say you do not know the user, or that you have not seen a project the block names. "
+            "Do not quote their message. Do not mention shell commands or 我來處理. "
+            "Do not invent facts that are not in the note or the known-facts block.\n" + RULE,
+            self.turn_model_note(ep)
+            + (("已知：\n" + brief + "\n") if brief else "")
+            + "使用者：\n" + (text or ""),
+            max_tokens=200, timeout=20, tier="fast", temperature=0.7)
+        m = re.search(r"\{.*\}", raw or "", re.S)
+        try:
+            data = json.loads(m.group(0)) if m else None
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            return "", True, bool(KNOW_RE.search(text or ""))
+        say = str(data.get("say") or "").strip()
+        if "我來處理" in say or "先執行" in say or "先讀" in say:
+            say = ""
+        work = bool(data.get("work", True))
+        know = bool(data.get("know")) or bool(KNOW_RE.search(text or ""))
+        if brief and re.search(r"不知道你是誰|不認識你|沒看過|don't know who you are|haven't seen", say, re.I):
+            say, work = "", True
+        if "我的名字是" in say or "my name is howard" in say.lower():
+            say = ""
+        model_id = str(ep.get("model") or "")
+        if model_id and _MODEL_RE.search(text or ""):
+            if model_id not in say:
+                say = f"我是 {model_id}。" if _zh(text or "") else f"I am {model_id}."
+            work, know = False, False
+        elif know:
+            work = False
+            if not say:
+                say = _honest_gap(text or "")
+        if work and re.search(r"請.{0,40}(給我|貼上|提供|傳給我)|could you (send|paste|share)", say):
+            work = False
+        return say, work, know
+
+    # ------------------------------------------------------------ 前景一則（小模型先說；要做的交給主模型。超過兩輪交給 orchestrator）
     def foreground(self, chat_id, uid, mode, text, files, msg_id):
         lock = self.chat_locks.setdefault(chat_id, threading.Lock())     # 同一聊天的前景共用一個 session 檔，一次一則
         if lock.locked():
@@ -806,27 +1084,35 @@ class Bridge:
         with lock:
             sid = self.pick_sid(chat_id)
             prompt = self.build_prompt(chat_id, mode, text)
+            know = False
+            if mode == "owner":
+                voice_ep = self._endpoint("main")
+                say, work, know = self.first_words(text, voice_ep)
+                if say:
+                    self.tg.send(chat_id, say, msg_id, essential=not work)
+                if not work:
+                    return
+                if know:
+                    prompt += (
+                        "\nThe user is asking what you already know. Answer from prior context and this turn. "
+                        "Do not scan the home directory.\n"
+                    )
             handle, stop = pirun.Handle(), threading.Event()
             with self.mu:
                 self.fg[chat_id] = handle
             threading.Thread(target=self._typing, args=(chat_id, stop), daemon=True).start()
-            t0, acked = time.time(), [False]
+            t0 = time.time()
 
             def on_round(said, calls, n):
-                if n == 1 and not acked[0]:
-                    acked[0] = True
-                    # 先回再做：第一個工具一開始就回一句「做什麼＋第一步」；模型自己有先說一句就用它的
-                    first = pirun.describe_call(calls[0])
-                    self.tg.send(chat_id, said.strip() or f"好，我來處理「{short(text, 14)}」，先{first}。", msg_id, essential=False)
                 if n >= PROMOTE_AT and mode == "owner":
                     return "abort"
 
             knobs = self.tune()
             ep = self._endpoint("main")
-            provider = ep["pi_provider"] if ep["provider"] == "grok" else self.provider
-            model = ep["model"] if ep["provider"] == "grok" else self.state.alias()
-            spec = pirun.Spec(self.pi, provider, model, sid, prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
-                              files=files, mode=mode, chat_prompt=CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
+            provider, model = self._pi_pair(ep)
+            log.info("foreground start chat=%s provider=%s model=%s", chat_id, provider, model)
+            spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
+                              files=files, mode=mode, chat_prompt=self.turn_model_note(ep) + CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
                               wall=int(knobs["fg_wall"]), stall=int(knobs["tool_stall"]),
                               max_ctx=int(float(knobs["compact_at"]) * 2.2))
             attempt, notified = 0, False
@@ -834,13 +1120,20 @@ class Bridge:
                 while True:
                     with self.slots:
                         r = pirun.run(spec, handle, on_round)
+                    if ep.get("provider") in ("grok", "chatgpt") and r.kind == "error" and not r.rounds:
+                        log.warning("%s foreground failed, using local model", ep.get("provider"))
+                        self._use_local_pi(spec)
+                        ep = {"provider": "local", "model": spec.alias}
+                        spec.prompt = self.turn_model_note(ep) + prompt
+                        spec.chat_prompt = self.turn_model_note(ep) + CHAT_ONLY_PROMPT
+                        continue
                     if r.kind == "error" and TRANSIENT.search(r.text) and attempt < len(RETRY_WAITS):
                         if not notified:
                             self.tg.send(chat_id, t(self.lang_for(chat_id, text), "retry"), essential=False)
                             notified = True
                         if handle.cancel.wait(RETRY_WAITS[attempt]):
                             return
-                        spec.prompt = "（連線剛才中斷，請接續剛才的任務。）" if r.rounds else prompt
+                        spec.prompt = self.turn_model_note(ep) + ("（連線剛才中斷，請接續剛才的任務。）" if r.rounds else prompt)
                         attempt += 1
                         continue
                     break
@@ -850,10 +1143,13 @@ class Bridge:
                     if self.fg.get(chat_id) is handle:
                         self.fg.pop(chat_id, None)
             self.last_turn = f"{time.time() - t0:.0f}s"
-            log.info("foreground done chat=%s kind=%s %s", chat_id, r.kind, self.last_turn)
+            log.info("foreground done chat=%s kind=%s provider=%s model=%s %s", chat_id, r.kind, spec.provider, spec.alias, self.last_turn)
             if r.kind == "cancelled":
                 return
             if r.kind in ("aborted", "loop", "stalled", "too_long", "timeout", "ctx_full") and mode == "owner":
+                if know or KNOW_RE.search(text or ""):
+                    self.answer_known(chat_id, text, r.trace, msg_id)       # 問認不認識、了解到哪：依這輪看到的答，不開搜尋工作
+                    return
                 self.promote(chat_id, text, sid, r.trace)                  # 這件比想像大 → 交給 orchestrator，聊天立刻空出來
                 return
             if r.kind == "final":
@@ -866,6 +1162,20 @@ class Bridge:
                 self.tg.send(chat_id, "（模型沒有產生回覆，換個說法或 /new 後再試一次）", msg_id)
             else:
                 self.tg.send(chat_id, f"（沒處理成：{short(r.text or r.kind, 200)}）", msg_id)
+
+    def answer_known(self, chat_id, text, trace, msg_id):
+        seen = "\n".join(
+            f"- {item.get('action', '')} → {item.get('result', '')} {item.get('paths', '')}".rstrip()
+            for item in (trace or [])
+        ) or "（這輪沒有留下工具結果）"
+        reply = self.llm_text(
+            "The user is asking what you already know, not asking you to search the disk. "
+            "Answer only from the notes. If they are thin, say what is missing. "
+            "Do not suggest scanning the home directory. You are the assistant, not the user. "
+            "Use the user's language.",
+            f"問題：{text}\n這輪實際看到的：\n{seen}",
+            max_tokens=400, timeout=45, tier="fast")
+        self.tg.send(chat_id, reply or "我手上這輪沒有足夠的紀錄可以答。你指定一個目錄，我再看那個目錄。", msg_id)
 
     def promote(self, chat_id, text, sid, trace):
         first = re.split(r"[，。,.；;：:！!？?\n]", re.sub(r"[「」『』]", "", text).strip())[0]
@@ -946,10 +1256,17 @@ class Bridge:
             self.state.d["fresh"][str(chat_id)] = False
             self.state.save()
         align = (
-            "Alignment: answer only from this message, the prior context, and what tools actually returned. "
-            "Do not claim work you did not do. Do not invent paths, hosts, or numbers.\n" + RULE + "\n"
+            "Alignment: answer only from this message, the prior context, the known facts, and what tools actually returned. "
+            "Do not claim work you did not do. Do not invent paths, hosts, or numbers that are not in the known facts or tool results. "
+            "You are the assistant. The user's name and biography are not your identity. "
+            "A short reply may already have been sent. Your message is the answer. "
+            "Do not quote the user or announce the next command. "
+            "If they ask what you know, answer from this message, the known facts, and prior context. Do not scan the home directory.\n"
+            + RULE + "\n"
         )
-        return head + (("（" + "；".join(notes) + "）\n") if notes else "") + align + text
+        brief = self.owner_brief()
+        known = ("已知（這些路徑與網址是真的，可以直接說）：\n" + brief + "\n") if brief else ""
+        return head + (("（" + "；".join(notes) + "）\n") if notes else "") + align + known + text
 
     def _typing(self, chat_id, stop):
         while not stop.is_set():
@@ -1039,7 +1356,8 @@ def main():
     br.recover()
     if os.environ.get("PITG_DASH", "1") != "0":
         from dashboard import Dashboard
-        dash = Dashboard(br, path=STATE_DIR + "/tune.json", log_path=os.environ.get("PITG_LOG", ""),
+        dash = Dashboard(br, path=STATE_DIR + "/tune.json",
+                         log_path=os.environ.get("PITG_LOG") or os.path.expanduser("~/.local/log/pi-tg-bridge.log"),
                          port=int(os.environ.get("PITG_DASH_PORT", "8787")))
         if dash.start():
             log.info("dashboard http://127.0.0.1:%s/", dash.port)
