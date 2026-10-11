@@ -180,4 +180,41 @@ new_sid = br.pick_sid(1)
 check("8d dangling → compacted + rotated before next message", new_sid != sid4 and br.state.d["fresh"].get("1") and "find ~" in br.state.d["summary"]["1"], (new_sid, br.state.d.get("summary")))
 check("8d healthy session not touched", not br.cx.dangling(B.SESSIONS_DIR, "tg-9-0"))
 br.command("/new", 1, 1, True); check("8 /new clears carried summary", "1" not in br.state.d["summary"] and not br.state.d["fresh"].get("1"))
+# 9 訂閱失敗（401/403/逾時，且還沒動工具）→ 前景與背景都改用地端重跑，log 一行 WARNING 說明原因
+B.sync_pi_provider = lambda *a, **k: None            # 不碰使用者的 ~/.pi/agent/models.json
+class Grab(logging.Handler):
+    def __init__(s): super().__init__(); s.msgs = []
+    def emit(s, rec): s.msgs.append(rec.getMessage())
+grab = Grab(); logging.getLogger("pi-tg").addHandler(grab)
+def err_ev(msg): return ev(type="turn_end", message={"role": "assistant", "content": [], "stopReason": "error", "errorMessage": msg})
+def sub_pi(name, grok_body): return fake(name, f'case "$*" in *"--provider grok"*) {grok_body} ;; *) echo \'{final_ev("LOCAL_OK")}\' ;; esac')
+def mk_sub(pi, fg_wall=None):
+    br, tg = mk(pi); br.env["XAI_API_KEY"] = "xai-test"; br.orch = FakeOrch()
+    br.llm_text = lambda *a, **k: '{"say":"","work":true,"know":false}'
+    if fg_wall:
+        orig = br.tune; br.tune = lambda: dict(orig(), fg_wall=fg_wall)
+    return br, tg
+os.environ["PITG_PROVIDER"] = "grok"
+M403 = '403 "The OAuth2 access token could not be validated."'
+for label, msg, wall in (("403", M403, None), ("401", "401 Unauthorized", None), ("timeout", None, 2)):
+    br, tg = mk_sub(sub_pi("sub_" + label, "sleep 30" if msg is None else f"echo '{err_ev(msg)}'"), wall)
+    grab.msgs.clear()
+    br.foreground(1, 1, "owner", "幫我整理今天的待辦清單", [], 21)
+    want = "auth" if msg else "timeout"
+    check(f"9 {label} on grok → foreground answered by local", bool(tg.sent) and tg.sent[-1][1] == "LOCAL_OK", tg.sent)
+    check(f"9 {label} → one WARNING with reason '{want}', no key in log", sum("grok run failed (" in m for m in grab.msgs) == 1 and any(f"grok run failed ({want}:" in m for m in grab.msgs) and not any("xai-test" in m for m in grab.msgs), grab.msgs)
+br, tg = mk_sub(sub_pi("sub_run403", f"echo '{err_ev(M403)}'"))
+r = br.run_pi(None, "sid-sub-run", "hi", B.pirun.Handle(), 0, 20)
+check("9 orchestrator path: 403 → local final", r.kind == "final" and r.text == "LOCAL_OK", (r.kind, r.text))
+br, tg = mk_sub(sub_pi("sub_runto", "sleep 30"))
+r = br.run_pi(None, "sid-sub-to", "hi", B.pirun.Handle(), 0, 2)
+check("9 orchestrator path: timeout → local final", r.kind == "final" and r.text == "LOCAL_OK", (r.kind, r.text))
+tool_then = fake("sub_tool", f'case "$*" in *"--provider grok"*) echo \'{tool_ev(1)}\'; echo \'{err_ev(M403)}\' ;; *) echo \'{final_ev("LOCAL_OK")}\' ;; esac')
+br, tg = mk_sub(tool_then)
+r = br.run_pi(None, "sid-sub-tool", "hi", B.pirun.Handle(), 0, 20)
+check("9 failure after a tool call is not retried (side effects)", r.kind == "error" and r.rounds == 1 and "403" in r.text, (r.kind, r.rounds, r.text))
+os.environ.pop("PITG_PROVIDER", None); os.environ.pop("PITG_FG_WALL", None)
+br, tg = mk(fake("noop9", "true"))
+check("9 default with no state file: provider local, model spark-main", br.tune()["provider"] == "local" and br.route_public()["provider"] == "local" and br.route_public()["model"] == "spark-main", (br.tune()["provider"], br.route_public()))
+logging.getLogger("pi-tg").removeHandler(grab)
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

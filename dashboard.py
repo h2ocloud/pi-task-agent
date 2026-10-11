@@ -20,7 +20,7 @@ DEFAULTS = {
     "tool_stall": 180,
     "fg_wall": 600,
     "planner_temperature": 0.2,
-    "provider": "auto",
+    "provider": "local",
 }
 BOUNDS = {
     "compact_at": (4000, 120000),
@@ -260,7 +260,7 @@ const I18N = {
   }
 };
 let lang = localStorage.getItem("pitg-lang") || "en";
-let routeMode = "auto";
+let routeMode = "local";
 const fields = ["compact_at","step_ctx","skill_mode","skill_limit","tool_stall","fg_wall","planner_temperature"];
 const recipeKeys = ["machine","model","server_context","kv","speculative","harness_compact","harness_step","tool_temperature","json_temperature","grok_fast","grok_main"];
 function L(){ return I18N[lang]; }

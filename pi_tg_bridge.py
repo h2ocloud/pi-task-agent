@@ -33,7 +33,7 @@ from orchestrator import Orchestrator, TRANSIENT
 from pirun import short
 from skills import format_list, skills_for
 from lang import RULE, default_lang, detect, t
-from providers import chatgpt_view, codex_body, codex_headers, codex_reply, grok_key, join_url, resolve, sync_pi_codex, sync_pi_provider
+from providers import chatgpt_view, codex_body, codex_headers, codex_reply, fallback_reason, grok_key, join_url, resolve, sync_pi_codex, sync_pi_provider
 
 HOME = os.path.expanduser("~")
 CFG_DIR = os.environ.get("PITG_CFG_DIR", HOME + "/.config/pi-tg-bridge")
@@ -474,7 +474,7 @@ class Bridge:
             "tool_stall": os.environ.get("PITG_TOOL_STALL", TOOL_STALL),
             "fg_wall": os.environ.get("PITG_FG_WALL", FG_WALL),
             "planner_temperature": os.environ.get("PITG_PLAN_TEMP", DEFAULTS["planner_temperature"]),
-            "provider": os.environ.get("PITG_PROVIDER", "auto"),
+            "provider": os.environ.get("PITG_PROVIDER", "local"),
         })
 
     def _local_up_now(self) -> bool:
@@ -512,9 +512,9 @@ class Bridge:
 
     def route_public(self) -> dict:
         """What the next message will use. No keys, and no health ping."""
-        mode = (self.tune().get("provider") or "auto").lower()
+        mode = (self.tune().get("provider") or "local").lower()
         if mode not in ("auto", "local", "grok", "chatgpt"):
-            mode = "auto"
+            mode = "local"
         signed = bool(grok_key(self.env))
         chat = chatgpt_view(self.env)
         local_model = self.state.alias()
@@ -548,7 +548,7 @@ class Bridge:
         )
 
     def _provider_line(self, chat_id) -> str:
-        mode = (self.tune().get("provider") or "auto").lower()
+        mode = (self.tune().get("provider") or "local").lower()
         lang = self.lang_for(chat_id)
         signed = "yes" if grok_key(self.env) else "no"
         view = chatgpt_view(self.env)
@@ -580,6 +580,10 @@ class Bridge:
         spec.provider = self.provider
         spec.alias = self.state.alias()
 
+    def _note_fallback(self, ep: dict, why: str, result) -> None:
+        log.warning("%s run failed (%s: %s), retrying on local %s", ep.get("provider"), why,
+                    pirun.scrub(short(result.text or result.kind, 160)), self.state.alias())
+
     def _post_to(self, ep: dict, path: str, body: dict, timeout: int):
         headers = {"Content-Type": "application/json"}
         if ep.get("key"):
@@ -602,8 +606,9 @@ class Bridge:
                           max_rounds=max_rounds, wall=wall, stall=int(data["tool_stall"]), max_ctx=max_ctx)
         with self.slots:
             result = pirun.run(spec, handle)
-        if ep.get("provider") in ("grok", "chatgpt") and result.kind == "error" and not result.rounds:
-            log.warning("%s tool run failed, using local model", ep.get("provider"))
+        why = fallback_reason(ep.get("provider"), result.kind, result.text, result.rounds)
+        if why:
+            self._note_fallback(ep, why, result)
             self._use_local_pi(spec)
             spec.prompt = self.turn_model_note({"provider": "local", "model": spec.alias}) + prompt
             with self.slots:
@@ -680,7 +685,7 @@ class Bridge:
     def backend_ok(self) -> bool:
         if self._ping_local():
             return True
-        mode = self.tune().get("provider") or "auto"
+        mode = self.tune().get("provider") or "local"
         return mode != "local" and bool(grok_key(self.env))
 
     def ping(self):
@@ -1120,8 +1125,9 @@ class Bridge:
                 while True:
                     with self.slots:
                         r = pirun.run(spec, handle, on_round)
-                    if ep.get("provider") in ("grok", "chatgpt") and r.kind == "error" and not r.rounds:
-                        log.warning("%s foreground failed, using local model", ep.get("provider"))
+                    why = fallback_reason(ep.get("provider"), r.kind, r.text, r.rounds)
+                    if why:
+                        self._note_fallback(ep, why, r)
                         self._use_local_pi(spec)
                         ep = {"provider": "local", "model": spec.alias}
                         spec.prompt = self.turn_model_note(ep) + prompt

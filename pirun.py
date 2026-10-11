@@ -196,7 +196,7 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
     err_buf: list[str] = []
     threading.Thread(target=lambda: err_buf.append(proc.stderr.read()), daemon=True).start()
 
-    st = {"tool_started": None, "inflight": 0, "stalls": 0, "reason": None, "t0": time.time(), "block_scan": False}
+    st = {"tool_started": None, "inflight": 0, "stalls": 0, "reason": None, "t0": time.time(), "block_scan": False, "provider_error": None}
     done = threading.Event()
 
     def note_stall():
@@ -241,6 +241,8 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
             continue
         t = ev.get("type")
         m = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        if t in ("message_end", "turn_end") and m.get("role") == "assistant" and m.get("stopReason") == "error":
+            st["provider_error"] = scrub(str(m.get("errorMessage") or "模型回報錯誤"))   # pi 遇到 401/403 仍是 rc=0，錯誤只在這裡
         if t in ("message_end", "turn_end") and m.get("role") == "assistant" and isinstance(m.get("usage"), dict):
             u = m["usage"]
             h.ctx_tokens = int(u.get("totalTokens") or (u.get("input", 0) + u.get("cacheRead", 0) + u.get("output", 0)))
@@ -307,6 +309,8 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
         return Result("cancelled", **base)
     if st["reason"]:
         return Result(st["reason"], text=final, **base)
+    if st["provider_error"]:
+        return Result("error", st["provider_error"], **base)
     if rc == 0 and final:
         return Result("final", final, **base)
     if rc == 0:

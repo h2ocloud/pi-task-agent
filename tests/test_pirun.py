@@ -80,4 +80,14 @@ check("13 home-wide find is stopped quickly", r.kind == "final" and r.stalls == 
 check("13 project find is not a home scan", not pirun.broad_scan("find /Users/howard/Projects/app -name x") and pirun.broad_scan("grep -r foo /Users/howard") and pirun.broad_scan("bash -c 'find ~ -maxdepth 4'"))
 long = "x" * 180 + " /Users/howard/Projects/app/README.md"
 check("13 path hints keep a path past the short preview", "/Users/howard/Projects/app/README.md" in pirun.path_hints(long))
+
+# 14 provider 錯誤：pi 遇到 401/403 仍 rc=0，原因只在 assistant 的 stopReason=error → kind=error 帶原因（不是 empty）
+def err_ev(msg): return ev(type="turn_end", message={"role": "assistant", "content": [], "stopReason": "error", "errorMessage": msg})
+for code, msg in (("403", '403 "The OAuth2 access token could not be validated."'), ("401", "401 Unauthorized")):
+    pi = fake(f"err{code}", f"echo '{err_ev(msg)}'")
+    r = pirun.run(spec(pi), pirun.Handle())
+    check(f"14 {code} reported by provider → kind=error with the reason", r.kind == "error" and r.text == msg, (r.kind, r.text))
+pi = fake("errmix", f"echo '{ev(type='message_end', message={'role': 'assistant', 'content': [{'type': 'text', 'text': '部分'}], 'stopReason': 'error', 'errorMessage': '500 boom'})}'")
+r = pirun.run(spec(pi), pirun.Handle())
+check("14 error after partial text is not returned as final", r.kind == "error" and r.text == "500 boom", (r.kind, r.text))
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

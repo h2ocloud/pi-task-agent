@@ -10,10 +10,13 @@ chatgpt — ChatGPT subscription (Codex OAuth, not an API key). Fast calls use g
         Task calls use gpt-5.6-luna. If that call fails, the bridge uses the local model.
         auto does not select this. Set the mode to chatgpt.
 
-auto (default): use local while it answers; if it does not, and a Grok credential is set, use Grok.
-local: never leave the machine.
+local (default): never leave the machine. This is the spark-main model.
+auto: use local while it answers; if it does not, and a Grok credential is set, use Grok.
 grok: Grok Build first. The local model is the fallback.
 chatgpt: ChatGPT subscription first. The local model is the fallback.
+
+A grok or chatgpt run that fails before its first tool call (401/403, OAuth or token errors,
+timeouts) is retried on the local model. See fallback_reason.
 
 Do not load a second weight next to the resident local model. The fast local tier is an alias
 on the same server, or the same model with a short reply.
@@ -23,6 +26,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -53,7 +57,7 @@ def grok_key(env: dict) -> str:
 
 def resolve(env: dict, tier: str, local_ok: bool, local_model: str, local_base: str, local_key: str) -> dict:
     """Return provider, base, key, model, pi_provider. tier is 'fast' or 'main'."""
-    mode = (env.get("PITG_PROVIDER") or "auto").strip().lower()
+    mode = (env.get("PITG_PROVIDER") or "local").strip().lower()
     if mode == "chatgpt":
         cred = chatgpt_credential(env)
         if cred:
@@ -95,6 +99,22 @@ def _local_choice(env: dict, local_model: str, local_base: str, local_key: str) 
         "model": local_model,
         "pi_provider": (env.get("PI_PROVIDER") or "spark").strip(),
     }
+
+
+AUTH_ERR = re.compile(r"\b40[13]\b|unauthori[sz]|authori[sz]|authenticat|\bauth\b|oauth|access token|refresh token|invalid_grant|could not be validated", re.I)
+TIMEOUT_ERR = re.compile(r"timed? ?out|ETIMEDOUT|deadline exceeded", re.I)
+
+
+def fallback_reason(provider: str, kind: str, text: str, rounds: int) -> str:
+    """Why a grok or chatgpt run should be retried on the local model, or "" for no retry.
+    Only before the first tool call: a retry after tool calls could repeat their side effects."""
+    if provider not in ("grok", "chatgpt") or rounds or kind not in ("error", "timeout"):
+        return ""
+    if kind == "timeout" or TIMEOUT_ERR.search(text or ""):
+        return "timeout"
+    if AUTH_ERR.search(text or ""):
+        return "auth"
+    return "error"
 
 
 CHATGPT_FAST = "gpt-5.4-mini"
