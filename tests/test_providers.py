@@ -125,6 +125,9 @@ check("timeout → timeout fallback (wall or network)", P.fallback_reason("grok"
 check("other error before a tool call falls back as error", P.fallback_reason("grok", "error", "500 upstream", 0) == "error")
 check("no fallback after a tool call (side effects)", P.fallback_reason("grok", "error", "403", 2) == "" and P.fallback_reason("grok", "timeout", "", 3) == "")
 check("no fallback for local, a normal answer, or empty", P.fallback_reason("local", "error", "403", 0) == "" and P.fallback_reason("grok", "final", "ok", 0) == "" and P.fallback_reason("grok", "empty", "", 0) == "")
+check("first-token silence → fallback with pirun's reason (grok and chatgpt)", P.fallback_reason("grok", "first_token", "first-token timeout 30s", 0) == "first-token timeout 30s" and P.fallback_reason("chatgpt", "first_token", "first-token timeout 30s", 0) == "first-token timeout 30s")
+check("first-token: no fallback for local or after a tool call", P.fallback_reason("local", "first_token", "first-token timeout 30s", 0) == "" and P.fallback_reason("grok", "first_token", "first-token timeout 30s", 1) == "")
+check("first_token_s: grok/chatgpt default 30, env overrides, 0 turns off, local never", P.first_token_s("grok", {}) == 30 and P.first_token_s("chatgpt", {}) == 30 and P.first_token_s("grok", {"PITG_FIRST_TOKEN_S": "5"}) == 5 and P.first_token_s("grok", {"PITG_FIRST_TOKEN_S": "0"}) == 0 and P.first_token_s("grok", {"PITG_FIRST_TOKEN_S": "-3"}) == 0 and P.first_token_s("local", {}) == 0)
 auth_dir = tempfile.mkdtemp(prefix="pitg-piauth-")
 authp = auth_dir + "/auth.json"
 json.dump({"providers": {"spark": {"apiKey": "keep"}}}, open(auth_dir + "/models.json", "w"))

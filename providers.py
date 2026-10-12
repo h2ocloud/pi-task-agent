@@ -16,7 +16,8 @@ grok: Grok Build first. The local model is the fallback.
 chatgpt: ChatGPT subscription first. The local model is the fallback.
 
 A grok or chatgpt run that fails before its first tool call (401/403, OAuth or token errors,
-timeouts) is retried on the local model. See fallback_reason.
+timeouts, or no output within PITG_FIRST_TOKEN_S seconds, default 30) is retried on the local
+model. See fallback_reason.
 
 Do not load a second weight next to the resident local model. The fast local tier is an alias
 on the same server, or the same model with a short reply.
@@ -105,11 +106,20 @@ AUTH_ERR = re.compile(r"\b40[013]\b|unauthori[sz]|authori[sz]|authenticat|\bauth
 TIMEOUT_ERR = re.compile(r"timed? ?out|ETIMEDOUT|deadline exceeded", re.I)
 
 
+def first_token_s(provider: str, env: dict) -> int:
+    """Seconds a grok or chatgpt run may stay silent before its first output. 0 = no watchdog."""
+    if provider not in ("grok", "chatgpt"):
+        return 0
+    return max(0, int(env.get("PITG_FIRST_TOKEN_S") or 30))
+
+
 def fallback_reason(provider: str, kind: str, text: str, rounds: int) -> str:
     """Why a grok or chatgpt run should be retried on the local model, or "" for no retry.
     Only before the first tool call: a retry after tool calls could repeat their side effects."""
-    if provider not in ("grok", "chatgpt") or rounds or kind not in ("error", "timeout"):
+    if provider not in ("grok", "chatgpt") or rounds or kind not in ("error", "timeout", "first_token"):
         return ""
+    if kind == "first_token":
+        return text                                      # pirun 已寫好原因：first-token timeout 30s
     if kind == "timeout" or TIMEOUT_ERR.search(text or ""):
         return "timeout"
     if AUTH_ERR.search(text or ""):

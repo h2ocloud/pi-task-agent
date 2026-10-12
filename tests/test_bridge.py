@@ -213,6 +213,27 @@ tool_then = fake("sub_tool", f'case "$*" in *"--provider grok"*) echo \'{tool_ev
 br, tg = mk_sub(tool_then)
 r = br.run_pi(None, "sid-sub-tool", "hi", B.pirun.Handle(), 0, 20)
 check("9 failure after a tool call is not retried (side effects)", r.kind == "error" and r.rounds == 1 and "403" in r.text, (r.kind, r.rounds, r.text))
+# 10 首字逾時（PITG_FIRST_TOKEN_S，測試縮成 2 秒）：grok 一個字都沒出來 → 前景與背景都改用地端；有輸出或動了工具後不套
+delta10 = ev(type="message_update", assistantMessageEvent={"type": "text_delta", "delta": "嗨"})
+tool10 = ev(type="tool_execution_start")
+def mk_ft(pi):
+    br, tg = mk_sub(pi); br.env["PITG_FIRST_TOKEN_S"] = "2"; return br, tg
+br, tg = mk_ft(sub_pi("ft_silent", "sleep 30"))
+grab.msgs.clear()
+br.foreground(1, 1, "owner", "幫我整理今天的待辦清單", [], 22)
+check("10 silent grok → foreground answered by local", bool(tg.sent) and tg.sent[-1][1] == "LOCAL_OK", tg.sent)
+check("10 one WARNING with reason 'first-token timeout 2s'", sum("grok run failed (" in m for m in grab.msgs) == 1 and any(m.startswith("grok run failed (first-token timeout 2s), retrying on local") for m in grab.msgs), grab.msgs)
+br, tg = mk_ft(sub_pi("ft_run", "sleep 30"))
+t0 = time.time(); r = br.run_pi(None, "sid-ft-run", "hi", B.pirun.Handle(), 0, 20)
+check("10 orchestrator path: silent grok → local final, cut at ~2s not wall", r.kind == "final" and r.text == "LOCAL_OK" and time.time() - t0 < 15, (r.kind, r.text, round(time.time() - t0, 1)))
+streaming = f"sleep 0.5; echo '{delta10}'; sleep 4; echo '{final_ev('GROK_OK')}'"
+br, tg = mk_ft(sub_pi("ft_streaming", streaming))
+r = br.run_pi(None, "sid-ft-ok", "hi", B.pirun.Handle(), 0, 20)
+check("10 grok output at 0.5s, silent 4s later → no first-token fallback", r.kind == "final" and r.text == "GROK_OK", (r.kind, r.text))
+tooled = f"echo '{tool10}'; sleep 4; echo '{final_ev('GROK_OK')}'"
+br, tg = mk_ft(sub_pi("ft_tool", tooled))
+r = br.run_pi(None, "sid-ft-tool", "hi", B.pirun.Handle(), 0, 20)
+check("10 tool started, silent 4s later → no first-token fallback", r.kind == "final" and r.text == "GROK_OK", (r.kind, r.text))
 os.environ.pop("PITG_PROVIDER", None); os.environ.pop("PITG_FG_WALL", None)
 br, tg = mk(fake("noop9", "true"))
 check("9 default with no state file: provider local, model spark-main", br.tune()["provider"] == "local" and br.route_public()["provider"] == "local" and br.route_public()["model"] == "spark-main", (br.tune()["provider"], br.route_public()))

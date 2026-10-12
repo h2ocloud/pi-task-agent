@@ -33,7 +33,7 @@ from orchestrator import Orchestrator, TRANSIENT
 from pirun import short
 from skills import format_list, skills_for
 from lang import RULE, default_lang, detect, t
-from providers import chatgpt_view, codex_body, codex_headers, codex_reply, fallback_reason, grok_key, join_url, resolve, sync_pi_codex, sync_pi_provider
+from providers import chatgpt_view, codex_body, codex_headers, codex_reply, fallback_reason, first_token_s, grok_key, join_url, resolve, sync_pi_codex, sync_pi_provider
 
 HOME = os.path.expanduser("~")
 CFG_DIR = os.environ.get("PITG_CFG_DIR", HOME + "/.config/pi-tg-bridge")
@@ -579,8 +579,12 @@ class Bridge:
     def _use_local_pi(self, spec) -> None:
         spec.provider = self.provider
         spec.alias = self.state.alias()
+        spec.first_token = 0
 
     def _note_fallback(self, ep: dict, why: str, result) -> None:
+        if result.kind == "first_token":                 # why 已經是完整原因（first-token timeout 30s）
+            log.warning("%s run failed (%s), retrying on local %s", ep.get("provider"), why, self.state.alias())
+            return
         log.warning("%s run failed (%s: %s), retrying on local %s", ep.get("provider"), why,
                     pirun.scrub(short(result.text or result.kind, 160)), self.state.alias())
 
@@ -603,7 +607,8 @@ class Bridge:
         log.info("pi run provider=%s model=%s", provider, model)
         spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA,
                           skills=skills_for(prompt, SKILLS_DIR),
-                          max_rounds=max_rounds, wall=wall, stall=int(data["tool_stall"]), max_ctx=max_ctx)
+                          max_rounds=max_rounds, wall=wall, stall=int(data["tool_stall"]), max_ctx=max_ctx,
+                          first_token=first_token_s(ep.get("provider"), self.env))
         with self.slots:
             result = pirun.run(spec, handle)
         why = fallback_reason(ep.get("provider"), result.kind, result.text, result.rounds)
@@ -1119,7 +1124,7 @@ class Bridge:
             spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
                               files=files, mode=mode, chat_prompt=self.turn_model_note(ep) + CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
                               wall=int(knobs["fg_wall"]), stall=int(knobs["tool_stall"]),
-                              max_ctx=int(float(knobs["compact_at"]) * 2.2))
+                              max_ctx=int(float(knobs["compact_at"]) * 2.2), first_token=first_token_s(ep.get("provider"), self.env))
             attempt, notified = 0, False
             try:
                 while True:

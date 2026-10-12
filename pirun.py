@@ -6,7 +6,9 @@
   • 輪數上限 max_rounds → kind=too_long（上層會把這一步拆小）
   • 上下文超過 max_ctx → kind=ctx_full（上層壓縮上下文後接續，不是失敗）
   • 牆鐘上限 wall → kind=timeout（只是安全網，不是「慢就砍」）
-注意：刻意不用「沒輸出」判斷整件卡住——模型在想、在等下載時本來就沒輸出。
+  • 首字逾時 first_token 秒（只給 grok/chatgpt；一個字都還沒出來、也還沒動工具）→ kind=first_token
+注意：除了首字逾時，刻意不用「沒輸出」判斷整件卡住——模型在想、在等下載時本來就沒輸出。
+首字逾時只看「從頭到尾一個字都沒出來」，一旦有輸出或動了工具就停用。
 pi 會等 stdin 結束才開工，所以一律 stdin=DEVNULL。
 """
 from __future__ import annotations
@@ -22,6 +24,8 @@ import time
 from dataclasses import dataclass, field
 
 log = logging.getLogger("pirun")
+# pi JSON 模式中代表「模型已經吐出內容」的串流事件；不含 start（連線一建立就會出現）
+FIRST_OUT = {"text_start", "text_delta", "thinking_start", "thinking_delta", "toolcall_start", "toolcall_delta"}
 
 
 _SCAN = re.compile(
@@ -140,11 +144,12 @@ class Spec:
     wall: int = 10800
     stall: int = 180
     loop_n: int = 3
+    first_token: int = 0                        # 首字逾時秒數（0＝不套）；有任何輸出或工具呼叫後就停用
 
 
 @dataclass
 class Result:
-    kind: str                                   # final|error|empty|cancelled|timeout|loop|too_long|stalled|ctx_full|aborted
+    kind: str                                   # final|error|empty|cancelled|timeout|loop|too_long|stalled|ctx_full|aborted|first_token
     text: str = ""
     rounds: int = 0
     trace: list = field(default_factory=list)   # [{"action","result"}]：做過什麼（上層規劃時當前情）
@@ -196,7 +201,7 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
     err_buf: list[str] = []
     threading.Thread(target=lambda: err_buf.append(proc.stderr.read()), daemon=True).start()
 
-    st = {"tool_started": None, "inflight": 0, "stalls": 0, "reason": None, "t0": time.time(), "block_scan": False, "provider_error": None}
+    st = {"tool_started": None, "inflight": 0, "stalls": 0, "reason": None, "t0": time.time(), "block_scan": False, "provider_error": None, "out": False}
     done = threading.Event()
 
     def note_stall():
@@ -214,6 +219,8 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
             now = time.time()
             if now - st["t0"] > spec.wall:
                 st["reason"] = "timeout"; kill_tree(proc.pid); return
+            if spec.first_token and not st["out"] and now - st["t0"] > spec.first_token:
+                st["reason"] = "first_token"; kill_tree(proc.pid); return
             if st["block_scan"] and st["inflight"]:
                 log.warning("stopping a home-wide scan")
                 note_stall()
@@ -241,6 +248,9 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
             continue
         t = ev.get("type")
         m = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        ame = ev.get("assistantMessageEvent") if isinstance(ev.get("assistantMessageEvent"), dict) else {}
+        if (t == "message_update" and ame.get("type") in FIRST_OUT) or t == "tool_execution_start" or (t in ("message_end", "turn_end") and m.get("role") == "assistant"):
+            st["out"] = True                                 # 已經有輸出或動了工具：首字逾時停用
         if t in ("message_end", "turn_end") and m.get("role") == "assistant" and m.get("stopReason") == "error":
             st["provider_error"] = scrub(str(m.get("errorMessage") or "模型回報錯誤"))   # pi 遇到 401/403 仍是 rc=0，錯誤只在這裡
         if t in ("message_end", "turn_end") and m.get("role") == "assistant" and isinstance(m.get("usage"), dict):
@@ -307,6 +317,8 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
     base = dict(rounds=h.rounds, trace=trace, stalls=st["stalls"], ctx_tokens=h.ctx_tokens)
     if h.cancel.is_set():
         return Result("cancelled", **base)
+    if st["reason"] == "first_token":
+        return Result("first_token", f"first-token timeout {spec.first_token}s", **base)
     if st["reason"]:
         return Result(st["reason"], text=final, **base)
     if st["provider_error"]:

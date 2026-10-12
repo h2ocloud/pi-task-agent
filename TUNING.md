@@ -22,7 +22,7 @@ Above 60000 tokens the dashboard warns you. Compact earlier.
 
 ## When the local server is down
 
-`PITG_PROVIDER=local` (default) only uses the local server (spark-main) and never leaves the machine. `auto` uses the local server while it answers. If it does not, and `XAI_API_KEY` is set, calls go to xAI. `grok` uses xAI even when the local server is up. A grok or chatgpt run that fails before its first tool call (401/403, token errors, timeouts) is retried on the local server, and the log gets one WARNING line with the reason.
+`PITG_PROVIDER=local` (default) only uses the local server (spark-main) and never leaves the machine. `auto` uses the local server while it answers. If it does not, and `XAI_API_KEY` is set, calls go to xAI. `grok` uses xAI even when the local server is up. A grok or chatgpt run that fails before its first tool call (401/403, token errors, timeouts) is retried on the local server, and the log gets one WARNING line with the reason. A run that produces no output within `PITG_FIRST_TOKEN_S` seconds (default 30; 0 turns this off) is cut and retried the same way. The watchdog stops once the model has output anything or started a tool.
 
 Two tiers, one resident weight. They may be the same endpoint.
 
