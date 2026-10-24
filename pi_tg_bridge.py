@@ -78,6 +78,10 @@ def apply_presets(env: dict):
 STATUS_RE = re.compile(r"(在忙什麼|在做什麼|在忙啥|進度|做到哪|有什麼在跑|有在跑什麼|還在跑嗎|好了嗎|完成了嗎|跑到哪)")
 STOP_RE = re.compile(r"(先停|停掉|停止|取消|別做了|不用做了|不要做了|算了)")
 KNOW_RE = re.compile(r"了解到哪|了解多少|知道多少|知道些什麼|你對.{0,40}了解|你認識|認不認識")
+# 要「做事」的請求一律交主模型（行事曆／提醒／信件／檔案／設定／多步長任務）
+ACTION_RE = re.compile(r"行事曆|日曆|行程|會議|排程|卡.{0,6}(時間|行事曆)|提醒|鬧鐘|待辦|寄|回信|信件|email|mail|郵件|邀請|檔案|文件|資料夾|上傳|下載|設定|安裝|部署|重啟|修|改|建立|新增|刪除|整理|查一下|幫我|幫忙|執行|跑|calendar|schedule|remind|meeting|file|install|deploy|setup|configure|run |create|delete|update|fix", re.I)
+# 小模型說「做不到」→ 不准自己回，強制交主模型
+CANT_RE = re.compile(r"做不到|無法|沒辦法|不能幫|沒有權限|無權|不支援|can't|cannot|unable|not able|don't have access", re.I)
 _MODEL_RE = re.compile(r"你是什麼模型|你是哪個模型|什麼模型|which model|what model", re.I)
 _WHO_RE = re.compile(r"我是誰|知道我是誰|who am i|who i am", re.I)
 _PORT_RE = re.compile(r"作品集|portfolio|程式碼在哪|網址", re.I)
@@ -1039,7 +1043,7 @@ class Bridge:
         """
         brief = self.owner_brief()
         direct = _direct_reply(text or "", brief, str(ep.get("model") or ""))
-        if direct:
+        if direct and not (ACTION_RE.search(text or "") and not direct[1]):
             return direct
         raw = self.llm_text(
             "You judge one message and speak first. A stronger model does the work only if you say so.\n"
@@ -1084,6 +1088,11 @@ class Bridge:
                 say = _honest_gap(text or "")
         if work and re.search(r"請.{0,40}(給我|貼上|提供|傳給我)|could you (send|paste|share)", say):
             work = False
+        if CANT_RE.search(say):
+            say, work = "", True                  # 小模型自稱做不到 → 一律交主模型
+        elif not work and ACTION_RE.search(text or "") and not _MODEL_RE.search(text or "") \
+                and not re.search(r"請.{0,40}(給我|貼上|提供|傳給我)|could you (send|paste|share)", say):
+            work = True                           # 可執行的請求不讓小模型自己擋掉
         return say, work, know
 
     # ------------------------------------------------------------ 前景一則（小模型先說；要做的交給主模型。超過兩輪交給 orchestrator）
