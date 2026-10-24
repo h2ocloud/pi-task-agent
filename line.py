@@ -2,7 +2,7 @@
 
 額度現實：官方帳號每月的推播則數有限（常見是 200）；用 reply token 回覆是免費的。所以：
   • 每個進來的事件帶一個 reply token（約 25 秒內可用一次）→ 第一則回覆走 reply（免費）
-  • 之後的訊息要 push：只送「必要的」（結果／被擋住／需要你）；進度、拆步驟公告這類（essential=False）在 LINE 不推
+  • 之後的訊息要 push：只送「必要的」（長工作的開始、結果／被擋住／需要你）；進度（essential=False）在 LINE 不推
   • 本地計數＋啟動時向 LINE 查實際用量；剩不到 5 則就停推，並改由另一個頻道通知擁有者（結果不丟）
 聊天 id 用 "line-<userId>" 字串，跟 Telegram 的整數 id 並存，Bridge 其餘邏輯完全共用。
 """
@@ -195,10 +195,13 @@ class Router:
     def __init__(self, tg, line: LineChannel | None = None):
         self.tg, self.line = tg, line
 
-    def send(self, chat_id, text, reply_to=None, essential=True):
+    def send(self, chat_id, text, reply_to=None, essential=True, key=None):
+        """key＝同一件工作的進度訊息：Telegram 原地更新同一則；LINE 只送 essential 的（開始），其餘不推也不佔 reply token。"""
         if self.line and self.line.owns(chat_id):
+            if key and not essential:
+                return None
             return self.line.send(chat_id, text, reply_to, essential)
-        return self.tg.send(chat_id, text, reply_to)
+        return self.tg.send(chat_id, text, reply_to, **({"key": key} if key else {}))
 
     def typing(self, chat_id):
         if self.line and self.line.owns(chat_id):

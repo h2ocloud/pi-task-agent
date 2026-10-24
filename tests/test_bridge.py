@@ -19,7 +19,7 @@ class TG:
     def flush_outbox(s): pass
 def mk(pi, jobs=None):
     tg = TG(); br = B.Bridge(tg, {"OWNER_ID": "1", "PI_BIN": pi, "SPARK_ENV": "/dev/null", "PITG_GROK_SESSION": "0"}, B.State(B.STATE_DIR + f"/s{time.time()}.json"), jobs or B.Jobs(B.STATE_DIR + f"/j{time.time()}.json"))
-    br.backend_ok = lambda: True; return br, tg
+    br.backend_ok = lambda: True; br.convo = B.ConvoLog(B.STATE_DIR + f"/c{time.time()}.json"); return br, tg
 def wait(tg, pred, t=20):
     end = time.time() + t
     with tg.cv:
@@ -70,7 +70,7 @@ class FakeOrch:
 br.orch = FakeOrch(); sid0 = br.state.sid(1)
 br.llm_text = lambda *a, **k: '{"say":"我先把九月的發票收成一張表。","work":true,"know":false}'
 br.foreground(1, 1, "owner", "把九月發票整理成表", [], 11)
-check("4 promoted: told user, session rotated, orchestrator got job+trace", any("多做幾步" in t for _, t in tg.sent) and br.state.sid(1) != sid0 and len(br.orch.calls) == 1 and len(br.orch.calls[0][1]) >= 2, (tg.sent, br.orch.calls))
+check("4 promoted: session rotated, orchestrator got job+trace (start message is the orchestrator's)", br.state.sid(1) != sid0 and len(br.orch.calls) == 1 and len(br.orch.calls[0][1]) >= 2 and not br.fg, (tg.sent, br.orch.calls))
 check("4 fast model speaks first, without quoting the command", any("收成一張表" in t for _, t in tg.sent) and not any("先執行" in t or "我來處理" in t or "echo 1" in t for _, t in tg.sent), tg.sent)
 pi = fake("know", "for i in 1 2 3 4; do echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"ls '$i'\"}}],\"stopReason\":\"toolUse\"}}'; sleep 0.1; done; sleep 30")
 br, tg = mk(pi); br.orch = FakeOrch(); br.llm_text = lambda *a, **k: "我只看過 toolhub-publish。"
@@ -105,7 +105,7 @@ check("4h a request for the missing text does not open tools", "三點" in say a
 prompt = br.build_prompt(1, "owner", "網址呢")
 check("known facts follow the do-not-invent line", prompt.find("Do not invent") < prompt.find("可以直接說") < prompt.find("網址呢"), prompt[prompt.find("Do not"):prompt.find("網址呢")+4])
 
-# 5 路由：狀態（不經模型）/ 補充 / 無關 / 分不出來→問 / 停止
+# 5 路由：狀態（不經模型）/ 補充 / 無關 / 分不出來→當新的事（不反問）/ 停止
 br, tg = mk(fake("noop", "true")); jobs = br.jobs
 j = jobs.add(1, "發票整理", "整理九月發票成表", "sid"); jobs.update(j, status="還在跑")
 llm_answer = {"v": {"route": "other"}}; br.llm_json = lambda s, u, m=300, tier="fast": llm_answer["v"]
@@ -121,9 +121,8 @@ llm_answer["v"] = {"route": "addto", "job": "發票整理"}
 check("5 supplement → added to job (not a new one)", br.route(1, "只要公司的", [], 6) and br.orch.sup == ["只要公司的"] and "已加進" in tg.sent[-1][1], (br.orch.sup, tg.sent[-1]))
 llm_answer["v"] = {"route": "other"}
 check("5 unrelated → not routed (foreground handles it)", br.route(1, "今天星期幾", [], 7) is False)
-llm_answer["v"] = {"route": "unclear"}
-check("5 unclear → asks once with options, holds the message", br.route(1, "改成十月", [], 8) and "加」或「新" in tg.sent[-1][1] and 1 in br.pending, tg.sent[-1])
-check("5 answer 加 → applied to job", br.route(1, "加", [], 9) and "改成十月" in br.orch.sup, br.orch.sup)
+llm_answer["v"] = {"route": "unclear"}; n5 = len(tg.sent)
+check("5 unclear → not routed, no 加/新 question (runs as its own thing)", br.route(1, "改成十月", [], 8) is False and len(tg.sent) == n5, tg.sent[n5:])
 check("5 stop by name only stops that one", br.route(1, "發票整理先停", [], 10) and br.orch.stopped == ["發票整理"] and j["status"] == "被擋住" and j["note"] == "依指示停止", (br.orch.stopped, j["status"]))
 
 # 6 等待回答的工作：他的回覆直接接續（並把回答釘住）
@@ -238,4 +237,102 @@ os.environ.pop("PITG_PROVIDER", None); os.environ.pop("PITG_FG_WALL", None)
 br, tg = mk(fake("noop9", "true"))
 check("9 default with no state file: provider local, model spark-main", br.tune()["provider"] == "local" and br.route_public()["provider"] == "local" and br.route_public()["model"] == "spark-main", (br.tune()["provider"], br.route_public()))
 logging.getLogger("pi-tg").removeHandler(grab)
+# 11 對話體驗：合併連發、平行不排隊、前文、問進度、喊停、同一件的催促/補充、去重、Telegram 原地更新
+def nlines(p): return len(open(p).read().splitlines()) if os.path.exists(p) else 0
+B.DEBOUNCE = 0.4
+br, tg = mk(fake("noop11", "true")); got = []
+br.process_message = lambda *a, **k: got.append(a)
+br.dispatch(1, True, "owner", "差我今天行事曆", [], 1, 1); time.sleep(0.15); br.dispatch(1, True, "owner", "查", [], 2, 1)
+br.dispatch(5, True, "chat", "別人", [], 3, 5); time.sleep(1.2)
+check("11a burst merged into one message (replies to the last)", [g for g in got if g[0] == 1] == [(1, 1, "owner", "差我今天行事曆\n查", [], 2)], got)
+check("11a another chat is not merged in", any(g[0] == 5 and g[3] == "別人" for g in got), got)
+sids_l = f"{tmp}/sids11l"
+br, tg = mk(fake("cal11", f'''echo "$*" | grep -o -- '--session-id [^ ]*' >> {sids_l}; echo '{final_ev("今天 10:00 週會")}' '''))
+br.llm_text = lambda *a, **k: '{"say":"我先看今天的行事曆。","work":true,"know":false}'
+br.dispatch(1, True, "owner", "差我今天行事曆", [], 41, 1); time.sleep(0.25); br.dispatch(1, True, "owner", "查", [], 42, 1)
+wait(tg, lambda: any("週會" in t for _, t in tg.sent), 10)
+check("11l 14:53 replay: one ack naming the first step, one answer, one pi run, no queue notice or ask-back",
+      [t for _, t in tg.sent] == ["我先看今天的行事曆。", "今天 10:00 週會"] and nlines(sids_l) == 1, (tg.sent, nlines(sids_l)))
+B.DEBOUNCE = 0
+
+sids = f"{tmp}/sids11"
+conc = f'''echo "$*" | grep -o -- '--session-id [^ ]*' >> {sids}
+last="${{@: -1}}"
+case "$last" in
+  *慢工作) sleep 3; echo '{final_ev("SLOW_DONE")}' ;;
+  *只要下午的) echo '{final_ev("FOLLOW_DONE")}' ;;
+  *) echo '{final_ev("FAST_DONE")}' ;;
+esac'''
+pi11 = fake("conc11", conc)
+def mk11():
+    br, tg = mk(pi11); br.orch = FakeOrch(); br.llm_text = lambda *a, **k: '{"say":"","work":true,"know":false}'; return br, tg
+br, tg = mk11()
+th = threading.Thread(target=br.foreground, args=(1, 1, "owner", "幫我跑一個慢工作", [], 30)); th.start(); time.sleep(0.8)
+t0 = time.time(); br.foreground(1, 1, "owner", "今天星期幾", [], 31); dt = time.time() - t0
+texts = [t for _, t in tg.sent]
+check("11b unrelated message answered while the first still runs (parallel, not queued)", "FAST_DONE" in texts and "SLOW_DONE" not in texts and dt < 2.5, (texts, round(dt, 1)))
+check("11b no 'previous one still running' notice", not any("前一件" in t for t in texts), texts)
+th.join(10); ids = open(sids).read()
+check("11b slow one finishes in the main session; the other used a side session", "SLOW_DONE" in [t for _, t in tg.sent] and ids.count("--session-id tg-1-") == 1 and ids.count("--session-id side-1-") == 1, ids)
+
+br, tg = mk11(); runs0 = nlines(sids)
+th = threading.Thread(target=br.foreground, args=(1, 1, "owner", "幫我跑一個慢工作", [], 32)); th.start(); time.sleep(0.8)
+check("11c 好了沒 → instant status of the running turn", br.route(1, "好了沒", [], 33) and "幫我跑一個慢工作" in tg.sent[-1][1] and "處理中" in tg.sent[-1][1], tg.sent[-1:])
+br.llm_json = lambda s, u, m=300, tier="fast": {"route": "same", "item": 1, "say": "還在跑那個慢工作，好了就給你。"}
+check("11d nudge about the running turn → one short ack, no new run", br.route(1, "快點", [], 34) and tg.sent[-1][1].startswith("還在跑") and nlines(sids) == runs0 + 1, (tg.sent[-1:], nlines(sids)))
+br.llm_json = lambda s, u, m=300, tier="fast": {"route": "addto", "item": 1}
+check("11e supplement to the running turn is noted, not run separately", br.route(1, "只要下午的", [], 35) and "記下了" in tg.sent[-1][1] and nlines(sids) == runs0 + 1, tg.sent[-1:])
+th.join(15); texts = [t for _, t in tg.sent]
+check("11e ...and handled right after the turn finishes", "SLOW_DONE" in texts and "FOLLOW_DONE" in texts and texts.index("SLOW_DONE") < texts.index("FOLLOW_DONE") and not br.fg, texts)
+
+br, tg = mk11(); runs0 = nlines(sids)
+th = threading.Thread(target=br.foreground, args=(1, 1, "owner", "幫我跑一個慢工作", [], 36)); th.start(); time.sleep(0.8)
+check("11f 停 stops the running foreground turn", br.route(1, "停", [], 37) and "停下了" in tg.sent[-1][1], tg.sent[-1:])
+th.join(10)
+check("11f ...and it never answers afterwards", "SLOW_DONE" not in [t for _, t in tg.sent] and not br.fg, tg.sent)
+check("11f 停車場 is not a stop command", not B.STOP_SHORT.fullmatch("停車場在哪") and not B.STOP_RE.search("停車場在哪"))
+
+br, tg = mk(fake("noop11g", "true")); seen = []
+br.convo.add(1, "u", "差我今天行事曆"); br.convo.add(1, "a", "今天 10:00 週會、14:00 客戶會議"); br.convo.add(1, "u", "那明天呢")
+br.llm_text = lambda system, user, *a, **k: (seen.append(user), '{"say":"查什麼呢？","work":false,"know":false}')[1]
+say, work, _ = br.first_words("那明天呢", {"provider": "local", "model": "spark-main"}, 1)
+check("11g fast model sees the recent conversation", "差我今天行事曆" in seen[-1] and "14:00 客戶會議" in seen[-1] and seen[-1].count("那明天呢") == 1, seen[-1])
+check("11g a short follow-up is not answered with a question back; the main model works", work is True and say == "", (say, work))
+p_side = br.build_prompt(1, "owner", "那明天呢", side=True)
+check("11h side-session prompt carries the recent turns", "最近對話" in p_side and "14:00 客戶會議" in p_side and p_side.rstrip().endswith("那明天呢"), p_side[:300])
+br.convo.mark(1); br.convo.add(1, "a", "做完：『週報』草稿在 /tmp/report.md"); br.convo.add(1, "a", "主 session 自己的回覆", "main"); br.convo.add(1, "u", "好")
+p1 = br.build_prompt(1, "owner", "好"); p2 = br.build_prompt(1, "owner", "再來")
+check("11h main session gets what happened outside it, once, without its own replies", "週報" in p1 and "另外發生" in p1 and "主 session 自己的回覆" not in p1 and "週報" not in p2, (p1[:300], p2[:200]))
+n = len(tg.sent); br.send(1, "同一句話"); br.send(1, "同一句話")
+check("11i identical message within a minute is sent once", [t for _, t in tg.sent[n:]] == ["同一句話"], tg.sent[n:])
+br.process_message = B.Bridge.process_message.__get__(br); br.route = lambda *a: False; br.foreground = lambda c, u, m, t, f, i: br.send(c, "同一句話")
+br.process_message(1, 1, "owner", "再說一次", [], 50)
+check("11i ...but when he asks again, the same answer is sent again", [t for _, t in tg.sent[n:]] == ["同一句話", "同一句話"], tg.sent[n:])
+
+class OrchK:
+    def __init__(s): s.ctrl = type("C", (), {"supplements": []})(); s.jobs = []
+    def start(s, job, trace=None, resumed=False): s.jobs.append(job); return s.ctrl
+    def describe(s, j): return ""
+    def get(s, i): return s.ctrl
+br, tg = mk(fake("noop11k", "true")); br.orch = OrchK(); sid0 = br.state.sid(1)
+w = {"label": "那明天呢", "text": "那明天呢", "started": time.time(), "handle": B.pirun.Handle(), "extras": ["只要下午"], "side": True, "job": None}
+br.fg[1] = [w]; br.convo.add(1, "u", "差我今天行事曆"); br.convo.add(1, "u", "那明天呢")
+br.promote(1, "那明天呢", "side-1-x", [], w)
+check("11k promote from a side session: main session kept, supplements carried, short goal gets context",
+      br.state.sid(1) == sid0 and br.orch.ctrl.supplements == ["只要下午"] and "差我今天行事曆" in br.orch.jobs[0].get("ctx", "") and not br.fg and w["job"] is br.orch.jobs[0],
+      (br.state.sid(1), br.orch.ctrl.supplements, br.orch.jobs[0].get("ctx"), br.fg))
+
+class TGK(B.Telegram):
+    def __init__(s): super().__init__("x"); s.log = []; s.n = 100
+    def call(s, method, _t=30, **p):
+        s.log.append((method, p.get("text"), p.get("message_id")))
+        if method == "sendMessage":
+            s.n += 1; return {"result": {"message_id": s.n}}
+        return {"result": True}
+tk = TGK(); tk.send(1, "開始", key="j"); tk.send(1, "進度 1/3", key="j")
+check("11j keyed progress edits the same Telegram message", [m for m, *_ in tk.log] == ["sendMessage", "editMessageText"] and tk.log[1][2] == 101, tk.log)
+tk.send(1, "別的回覆"); tk.send(1, "進度 2/3", key="j")
+check("11j once buried under another message, progress becomes a fresh message", [m for m, *_ in tk.log][-2:] == ["sendMessage", "sendMessage"] and tk.keyed[(1, "j")] == 103, tk.log)
+tk.send(1, "進度 3/3", key="j")
+check("11j ...and later progress edits that newest one", tk.log[-1][0] == "editMessageText" and tk.log[-1][2] == 103, tk.log)
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

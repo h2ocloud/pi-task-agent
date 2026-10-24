@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 
 class FakeTG:
     def __init__(s): s.sent = []; s.cv = threading.Condition()
-    def send(s, chat_id, text, reply_to=None, essential=True):
+    def send(s, chat_id, text, reply_to=None, essential=True, **k):
         with s.cv: s.sent.append((chat_id, text)); print(f"   [TG→{chat_id}] {text[:110]!r}"); s.cv.notify_all()
     def typing(s, chat_id): pass
     def call(s, *a, **k): return {"result": {}}

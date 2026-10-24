@@ -13,8 +13,8 @@ class FakeJobs:
 class Env:
     log = logging.getLogger("t")
     def __init__(s, script):
-        s.jobs = FakeJobs(); s.sent = []; s.script = script; s.calls = []; s.llm_log = []; s.backend = True
-    def send(s, chat_id, text, reply_to=None, essential=True): s.sent.append(text)
+        s.jobs = FakeJobs(); s.sent = []; s.meta = []; s.script = script; s.calls = []; s.llm_log = []; s.backend = True
+    def send(s, chat_id, text, reply_to=None, essential=True, key=None): s.sent.append(text); s.meta.append((text, essential, key))
     def run_pi(s, job, sid, prompt, handle, max_rounds, wall, max_ctx=0):
         s.calls.append((sid, prompt)); return s.script(sid, prompt, len(s.calls), s)
     def llm_json(s, system, user, max_tokens=300, tier="fast"):
@@ -43,7 +43,10 @@ def check(name, cond, info=""):
 env = Env(lambda sid, p, n, e: Result("final", f"步驟完成 /tmp/out{n}.txt", rounds=2, trace=[{"action": f"寫 /tmp/out{n}.txt", "result": "ok"}])); env.llm_handler = planner(["讀檔", "整理", "輸出"])
 job = mkjob(); run_job(env, job)
 check("1 normal: done + 3 pi runs", job["status"] == "做完" and len(env.calls) == 3, (job["status"], len(env.calls)))
-check("1 plan announced first", env.sent and "拆成 3 步" in env.sent[0], env.sent[:1])
+check("1 start said first, then the plan", env.sent and "多做幾步" in env.sent[0] and "拆成 3 步" in env.sent[1], env.sent[:2])
+ess = [m for m, e, k in env.meta if e]
+check("1 LINE budget: only start + done are essential; plan/milestones are keyed progress", len(ess) == 2 and "多做幾步" in ess[0] and ess[1].startswith("做完")
+      and all(k == job["id"] for m, e, k in env.meta if not e) and sum("進行中 " in m for m, e, k in env.meta) == 3, env.meta)
 check("1 digest carries paths", "/tmp/out1.txt" in job.get("digest", "") and "/tmp/out3.txt" in job["digest"], job.get("digest"))
 check("1 goal pinned verbatim in every step prompt", all("整理九月發票" in c[1] for c in env.calls))
 

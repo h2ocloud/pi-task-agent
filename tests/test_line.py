@@ -6,7 +6,7 @@ os.environ["PITG_LANG"] = "zh"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 tmp = tempfile.mkdtemp(prefix="pitg-line-test-")
 import line as L, pi_tg_bridge as B
-B.STATE_DIR = tmp; B.MEDIA_DIR = tmp + "/media"; B.SESSIONS_DIR = tmp + "/s"; B.CHAT_CWD = tmp + "/c"; B.DATA = tmp; B.SKILLS_DIR = tmp
+B.DEBOUNCE = 0; B.STATE_DIR = tmp; B.MEDIA_DIR = tmp + "/media"; B.SESSIONS_DIR = tmp + "/s"; B.CHAT_CWD = tmp + "/c"; B.DATA = tmp; B.SKILLS_DIR = tmp
 SECRET = "s3cr3t"
 class FakeClient(L.LineClient):
     def __init__(s, limit=200, used=0):
@@ -118,5 +118,11 @@ class L2:
     def flush_outbox(s): pass
 rt = L.Router(T2(), L2()); rt.send(123, "tg"); rt.send("line-U1", "line", essential=False)
 check("9 router: int→Telegram, 'line-…'→LINE (flag carried)", sent_tg == [(123, "tg")] and sent_line == [("line-U1", "line", False)], (sent_tg, sent_line))
+# 10 通道層開關：同一件工作的進度（key）在 LINE 不推也不佔 reply token；開始（essential）照推
+c = FakeClient(); ch = L.LineChannel(c, tmp, tmp + "/m"); rt = L.Router(T2(), ch); ch.note_event("line-Uk", "RTK")
+rt.send("line-Uk", "『行事曆』進行中 1/3", essential=False, key="j1")
+check("10 LINE: keyed progress dropped, reply token kept", c.calls == [] and not ch.tokens["line-Uk"][2], c.calls)
+rt.send("line-Uk", "這件要多做幾步…", essential=True, key="j1")
+check("10 LINE: keyed start (essential) goes out on the free reply token", c.calls and c.calls[-1][0] == "reply", c.calls)
 srv.httpd.shutdown()
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

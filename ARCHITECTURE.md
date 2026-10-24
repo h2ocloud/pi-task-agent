@@ -65,8 +65,18 @@ Grok defaults: fast `grok-4-1-fast-non-reasoning`, main `grok-build-0.1`, base `
 
 `lang.detect` is a character heuristic so a slash command still works when the fast model is down. Model prompts end with a rule: answer in the user's language, Traditional Chinese or English, and do not default to Chinese. Chrome strings use the same choice. Stored job status stays the four Chinese words.
 
+## Conversation
+
+One path for Telegram and LINE (`convo.py`).
+
+- **Burst merge.** Messages from one person within `PITG_DEBOUNCE` seconds (default 2.5, capped at 8 from the first) become one message. Slash commands skip the wait.
+- **Shared recent turns.** The bridge keeps the last ~12 exchanges per chat (`state/convo.json`). The fast model, the triage call, side sessions, and a short promoted goal all get them, plus what is running now. So 查, 好, 那明天呢 continue the last request instead of being asked back. The main pi session gets what happened outside it since its last turn, once.
+- **No queue.** The fast model answers before any lock. If the main session is busy, a new task runs in a side session (`side-<chat>-<id>`, recent turns prepended) under the same `MAX_RUNS` limit. Nothing says "the previous one is still running".
+- **Messages about running work.** 好了沒 / 進度 gets the status of foreground turns and jobs at once. 停 / 取消 stops the one running thing, or asks which when there are several. Anything else is classified against the running items: `same` (a nudge) gets one short line, `addto` is handed to that item (after the turn, or as a job supplement), `other` runs in parallel. No 加/新 question.
+- **One message per job.** A job's start, plan, and milestones carry a key. Telegram edits that one message while it is still the latest, and sends a fresh one once other messages bury it. The bridge skips a message identical to its last one within a minute unless the user spoke in between.
+
 ## Channels
 
-Telegram long-polling, optional LINE webhook. LINE spends the free reply token first. Later pushes are only the result, a block, or a question. Progress messages are not pushed. Under five pushes remaining, the other channel is used so the result is not dropped. Chat-only users get `--no-tools`.
+Telegram long-polling, optional LINE webhook. LINE spends the free reply token first. Later pushes are only a job's start, the result, a block, or a question. Keyed progress is never pushed on LINE and never takes the reply token, so a long job costs two pushes. Under five pushes remaining, the other channel is used so the result is not dropped. Chat-only users get `--no-tools`.
 
 Outbound mail is a prompt rule on the step, not a shell deny-list. Treat that as a gap if you run this against an untrusted chat.

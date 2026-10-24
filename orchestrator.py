@@ -7,7 +7,7 @@
 重啟、後端暫時離線都會自己接續。狀態全存在 job 記錄裡（jobs.json），隨時可接續。
 
 依賴（鴨子型別，方便測試）env 需提供：
-  send(chat_id, text) · run_pi(job, sid, prompt, handle, max_rounds, wall) -> pirun.Result
+  send(chat_id, text, essential=, key=)（key＝同一件工作的開始/進度，通道可原地更新同一則）· run_pi(job, sid, prompt, handle, max_rounds, wall) -> pirun.Result
   llm_json(system, user, max_tokens) -> dict|None · llm_text(system, user, max_tokens) -> str|None
   backend_ok() -> bool · jobs (Jobs 登錄檔) · log
 """
@@ -84,7 +84,7 @@ VERIFIER += "\n" + RULE
 STEP_PROMPT = """你正在完成一件較大的任務裡的「其中一步」。只做這一步，不要重做前面做過的事，也不要提前做後面的步驟。
 
 整體目標（原文，方向以此為準）：{goal}
-{pins}計畫：
+{ctx}{pins}計畫：
 {plan}
 目前累積的進度與關鍵事實：
 {prev}
@@ -212,6 +212,7 @@ class Orchestrator:
         timer = threading.Thread(target=self._progress_loop, args=(job, ctrl), daemon=True)
         try:
             if not job.get("plan"):
+                self._note(job, "這件要多做幾步，我先排一下步驟；你可以繼續聊別的，好了跟你說。", essential=True)
                 job["plan"] = self.make_plan(job, trace)
                 env.jobs.update(job, status="還在跑")
                 self.announce(job)
@@ -247,6 +248,8 @@ class Orchestrator:
                 i += 1
                 continue
             all_ok = self.do_step(job, steps, i, depth, ctrl) and all_ok
+            if depth == 0:
+                self.milestone(job)
             i += 1
         return all_ok
 
@@ -311,7 +314,8 @@ class Orchestrator:
         extra = [hint] if hint else []
         lang = detect(job.get("goal") or "")
         pins = (t(lang, "pins", body="\n".join(f"- {x}" for x in job["pins"][-8:])) + "\n") if job.get("pins") else ""
-        base = dict(goal=short(job["goal"], 400), plan=self.plan_text(job["plan"], step["id"]), pins=pins,
+        ctx = f"對話脈絡（只用來看懂目標裡簡短的說法）：\n{job['ctx']}\n" if job.get("ctx") else ""
+        base = dict(goal=short(job["goal"], 400), ctx=ctx, plan=self.plan_text(job["plan"], step["id"]), pins=pins,
                     prev=job.get("digest") or "（還沒有）", title=step["title"], done=step["done_when"] or "（自行判斷合理的完成）")
         n, carries, carry = 0, 0, ""
         while True:
@@ -358,7 +362,8 @@ class Orchestrator:
     def make_plan(self, job, trace):
         tr = "\n".join(f"- {t['action']} → {short(t['result'], 80)}" for t in (trace or [])[:6]) or "（無）"
         sup = "；".join(job.get("pins", [])) or "（無）"
-        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n已做過的前情：\n{tr}\n補充：{sup}", 600, tier="main")
+        ctx = f"對話脈絡（只用來看懂任務裡簡短的說法）：\n{job['ctx']}\n" if job.get("ctx") else ""
+        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n{ctx}已做過的前情：\n{tr}\n補充：{sup}", 600, tier="main")
         steps = parse_steps(obj)
         if not steps:                                     # 退階：規劃失敗 → 整件當一步交給遞迴機制去拆
             steps = [new_step("1", job["goal"], "任務完成並回報結果")]
@@ -394,12 +399,29 @@ class Orchestrator:
         self.env.send(job["chat_id"], "好，我照新的要求調整了後面的做法：\n" + "\n".join(f"{k}. {s['title']}" for k, s in enumerate(new[:4], 1)), essential=False)
 
     # ------------------------------------------------------------ reporting
+    def _note(self, job, text, essential=False):
+        """同一件工作的開始與進度：帶 key，Telegram 原地更新同一則不洗版；LINE 只推 essential 的那一則（開始）。"""
+        self.env.send(job["chat_id"], text, essential=essential, key=job["id"])
+
+    @staticmethod
+    def checklist(plan) -> str:
+        marks = {"done": "✓", "skipped": "✗", "doing": "▶"}
+        return "\n".join(f"{marks.get(s['status'], '・')} {k}. {s['title']}" for k, s in enumerate(plan, 1))
+
     def announce(self, job):
         plan = job["plan"]
         if len(plan) < 2:
             return
-        lines = "\n".join(f"{k}. {s['title']}" for k, s in enumerate(plan, 1))
-        self.env.send(job["chat_id"], f"好，『{job['name']}』我拆成 {len(plan)} 步來做：\n{lines}\n先從第 1 步開始，要改方向隨時說。", essential=False)
+        self._note(job, f"好，『{job['name']}』我拆成 {len(plan)} 步來做：\n{self.checklist(plan)}\n要改方向隨時說。")
+
+    def milestone(self, job):
+        """里程碑：同一則清單打勾（不另發新訊息）。"""
+        plan = job.get("plan") or []
+        if len(plan) < 2:
+            return
+        done = sum(s["status"] in ("done", "skipped") for s in plan)
+        mins = int((time.time() - job["started"]) // 60)
+        self._note(job, f"『{job['name']}』進行中 {done}/{len(plan)}（已 {mins} 分鐘）：\n{self.checklist(plan)}")
 
     def _progress_loop(self, job, ctrl):
         last = time.time()
@@ -407,14 +429,14 @@ class Orchestrator:
             time.sleep(5)
             if time.time() - last >= PROGRESS_EVERY:
                 last = time.time()
-                mins = int((time.time() - job["started"]) // 60)
-                self.env.send(job["chat_id"], f"『{job['name']}』還在進行（已 {mins} 分鐘）：{self.describe(job)}。做完我再跟你說。", essential=False)
+                self.milestone(job)
 
     def conclude(self, job, ctrl, ok):
         env, plan = self.env, job["plan"]
         done, total = flat_progress(plan)
         lines = self.result_lines(plan)
         text = env.llm_text(REPORTER, f"使用者原本交代的任務（原文）：{short(job['goal'], 800)}\n"
+                                      + (f"對話脈絡（看懂任務用）：\n{job['ctx']}\n" if job.get("ctx") else "")
                                       + (f"之後補充/回答的要求：{'；'.join(job.get('pins', []))}\n" if job.get("pins") else "")
                                       + f"各部分的做法與結果：\n{short(lines, 7000)}", 900, tier="main")
         if not text or len(text) < 5:

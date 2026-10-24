@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 T0 = time.time()
 class TG:
     def __init__(s): s.sent = []; s.cv = threading.Condition()
-    def send(s, c, t, r=None, essential=True):
+    def send(s, c, t, r=None, essential=True, **k):
         with s.cv: s.sent.append(t); print(f"\n[+{time.time()-T0:4.0f}s TG] {t}\n", flush=True); s.cv.notify_all()
     def typing(s, c): pass
     def call(s, *a, **k): return {"result": {}}

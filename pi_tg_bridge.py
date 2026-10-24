@@ -28,6 +28,7 @@ import uuid
 
 import pirun
 from context import Compactor
+from convo import ConvoLog, Debouncer
 from line import LineChannel, LineClient, Router, WebhookServer
 from orchestrator import Orchestrator, TRANSIENT
 from pirun import short
@@ -53,6 +54,10 @@ RETRY_WAITS = (15, 30, 60)         # 暫時性錯誤的重試間隔
 SESSION_MAX_BYTES = 2_000_000      # session 檔過大就自動開新的（本地模型 context 有限）
 TYPING_EVERY = 4
 POLL_TIMEOUT = 50
+DEBOUNCE = float(os.environ.get("PITG_DEBOUNCE", "2.5"))          # 同一人連發：等這麼久沒新訊息才合成一則處理（0＝不等）
+DEBOUNCE_CAP = 8.0                 # 從第一則起最多等這麼久
+DUP_WINDOW = 60                    # 他沒再說話的這段時間內，一字不差的訊息只送一次
+CTX_TURNS = 8                      # 帶給快速模型／平行 session 的最近對話則數
 ACTIVE = ("開始了", "還在跑")
 
 BASE_PRESETS = {                   # /model 可選。別名對到你在 pi 裡設定的 provider 模型，不要寫死某台機器。
@@ -75,8 +80,9 @@ def apply_presets(env: dict):
         k, v = k.strip(), v.strip()
         if k and v:
             PRESETS[k] = v
-STATUS_RE = re.compile(r"(在忙什麼|在做什麼|在忙啥|進度|做到哪|有什麼在跑|有在跑什麼|還在跑嗎|好了嗎|完成了嗎|跑到哪)")
+STATUS_RE = re.compile(r"(在忙什麼|在做什麼|在忙啥|進度|做到哪|有什麼在跑|有在跑什麼|還在跑嗎|好了嗎|好了沒|完成了嗎|跑到哪|還要多久|怎麼樣了|查到了嗎|done yet)", re.I)
 STOP_RE = re.compile(r"(先停|停掉|停止|取消|別做了|不用做了|不要做了|算了)")
+STOP_SHORT = re.compile(r"\s*(停|停下|停一下|先不用|不用了|stop|cancel)[!！.。~～\s]*", re.I)    # 只認整句，避免「停車場」
 KNOW_RE = re.compile(r"了解到哪|了解多少|知道多少|知道些什麼|你對.{0,40}了解|你認識|認不認識")
 # 要「做事」的請求一律交主模型（行事曆／提醒／信件／檔案／設定／多步長任務）
 ACTION_RE = re.compile(r"行事曆|日曆|行程|會議|排程|卡.{0,6}(時間|行事曆)|提醒|鬧鐘|待辦|寄|回信|信件|email|mail|郵件|邀請|檔案|文件|資料夾|上傳|下載|設定|安裝|部署|重啟|修|改|建立|新增|刪除|整理|查一下|幫我|幫忙|執行|跑|calendar|schedule|remind|meeting|file|install|deploy|setup|configure|run |create|delete|update|fix", re.I)
@@ -313,6 +319,8 @@ class Telegram:
         self.base = f"https://api.telegram.org/bot{token}"
         self.outbox = outbox
         self.mu = threading.Lock()
+        self.keyed: dict = {}                     # (chat id, key) -> 那則進度訊息的 message_id
+        self.last_id: dict = {}                   # chat id -> 最後送出的 message_id
 
     def call(self, method: str, _t: int = 30, **params):
         data = json.dumps(params).encode() if params else None
@@ -320,22 +328,37 @@ class Telegram:
         with urllib.request.urlopen(req, timeout=_t) as r:
             return json.loads(r.read().decode())
 
-    def _send_one(self, p: dict) -> bool:
+    def _send_one(self, p: dict):
+        """送出一則；成功回 message_id（拿不到就 True），失敗回 None。"""
         for wait in (0, 2, 6):
             time.sleep(wait)
             try:
-                self.call("sendMessage", **p)
-                return True
+                r = self.call("sendMessage", **p)
+                return ((r or {}).get("result") or {}).get("message_id") or True
             except urllib.error.HTTPError as e:
                 if e.code == 400 and "reply" in str(getattr(e, "reason", "")).lower() + e.read().decode()[:200].lower():
                     p = {k: v for k, v in p.items() if not k.startswith(("reply_to", "allow_sending"))}
                     continue
             except Exception:
                 pass
-        return False
+        return None
 
-    def send(self, chat_id: int, text: str, reply_to: int | None = None, essential: bool = True):
+    def _edit(self, chat_id, mid: int, text: str) -> bool:
+        try:
+            self.call("editMessageText", chat_id=chat_id, message_id=mid, text=text)
+            return True
+        except urllib.error.HTTPError as e:
+            return e.code == 400 and "not modified" in e.read().decode(errors="ignore")
+        except Exception:
+            return False
+
+    def send(self, chat_id: int, text: str, reply_to: int | None = None, essential: bool = True, key: str | None = None):
+        """key：同一件工作的進度。那則還是聊天裡最後一則 → 原地改字（不洗版）；被別的訊息蓋過去 → 發新的一則。"""
         text = text or "（沒有產生回覆）"
+        if key and len(text) <= 4000:
+            mid = self.keyed.get((chat_id, key))
+            if mid and mid == self.last_id.get(chat_id) and self._edit(chat_id, mid, text):
+                return
         chunks, cur = [], ""
         for line in text.split("\n"):
             while len(line) > 4000:
@@ -353,9 +376,14 @@ class Telegram:
             if reply_to and i == 0:
                 p["reply_to_message_id"] = reply_to
                 p["allow_sending_without_reply"] = True
-            if not self._send_one(p):                     # 退階：送不出去就先存起來，網路恢復後補送，結果不會丟
+            mid = self._send_one(p)
+            if not mid:                                   # 退階：送不出去就先存起來，網路恢復後補送，結果不會丟
                 log.warning("sendMessage failed 3x, parked in outbox")
                 self._park({"chat_id": chat_id, "text": c})
+            elif type(mid) is int:
+                self.last_id[chat_id] = mid
+                if key:
+                    self.keyed[(chat_id, key)] = mid
 
     def _park(self, p: dict):
         if self.outbox:
@@ -436,9 +464,11 @@ class Bridge:
         self.slots = threading.Semaphore(MAX_RUNS)
         self.orch = Orchestrator(self)
         self.cx = Compactor(self)
-        self.chat_locks: dict[int, threading.Lock] = {}
-        self.fg: dict[int, pirun.Handle] = {}       # chat id -> 前景那一則的 handle（/stop 用）
-        self.pending: dict[int, dict] = {}          # chat id -> 等使用者回「加/新」的那則
+        self.chat_locks: dict[int, threading.Lock] = {}     # 主 session 一次一則；忙的時候新的一則開平行 session
+        self.fg: dict = {}                          # chat id -> 正在跑的前景工作 [{label, text, started, handle, extras, side, job}]
+        self.convo = ConvoLog(STATE_DIR + "/convo.json")
+        self.inbox = Debouncer(self._flush_inbox, DEBOUNCE, DEBOUNCE_CAP)
+        self.last_sent: dict = {}                   # chat id -> (text, ts)：擋重複
         self.deferred: list[dict] = []              # 後端離線時先記下的訊息，恢復後自動處理
         self.mu = threading.RLock()
         self.last_turn = ""
@@ -449,8 +479,18 @@ class Bridge:
             pass
 
     # ------------------------------------------------------------ orchestrator's env interface
-    def send(self, chat_id, text, reply_to=None, essential=True):
-        self.tg.send(chat_id, text, reply_to, essential=essential)
+    def send(self, chat_id, text, reply_to=None, essential=True, key=None, via=""):
+        """對話的唯一出口：記進對話紀錄；他沒再說話時擋掉一分鐘內一字不差的重複。key＝同一件工作的進度（不記、不擋，通道決定怎麼呈現）。"""
+        if not key:
+            now = time.time()
+            with self.mu:
+                last = self.last_sent.get(chat_id)
+                if last and last[0] == text and now - last[1] < DUP_WINDOW:
+                    log.info("skip duplicate message chat=%s", chat_id)
+                    return
+                self.last_sent[chat_id] = (text, now)
+            self.convo.add(chat_id, "a", text, via)
+        self.tg.send(chat_id, text, reply_to, essential=essential, **({"key": key} if key else {}))
 
     def lang_for(self, chat_id, text: str = "") -> str:
         saved = self.state.d.setdefault("lang", {})
@@ -714,18 +754,37 @@ class Bridge:
             return f"『{j['name']}』｜被擋住：{short(j['note'], 60)}{tail}"
         return f"『{j['name']}』｜做完（{mins} 分鐘）"
 
+    @staticmethod
+    def fg_line(w: dict) -> str:
+        secs = int(time.time() - w["started"])
+        took = f"{secs} 秒" if secs < 120 else f"{secs // 60} 分鐘"
+        acts = w["handle"].rounds
+        return f"『{w['label']}』｜處理中｜已 {took}" + (f"｜做了 {acts} 個動作" if acts else "")
+
+    def inflight(self, chat_id) -> list:
+        with self.mu:
+            return list(self.fg.get(chat_id, []))
+
     def jobs_text(self, chat_id: int) -> str:
         mine = self.jobs.of(chat_id)
         act = [j for j in mine if j["status"] in ACTIVE]
         blocked = [j for j in mine if j["status"] == "被擋住" and time.time() - (j["finished"] or 0) < 7 * 86400]
         recent = [j for j in mine if j["status"] == "做完" and time.time() - (j["finished"] or 0) < 86400][-3:]
-        if not (act or blocked or recent):
+        fg = [self.fg_line(w) for w in self.inflight(chat_id)]
+        if not (fg or act or blocked or recent):
             return t(self.lang_for(chat_id), "no_jobs")
         lines = []
-        for title, group in (("進行中：", act), ("被擋住：", blocked), ("最近做完：", recent)):
+        for title, group in (("進行中：", fg + [self.job_line(j) for j in act]), ("被擋住：", [self.job_line(j) for j in blocked]),
+                             ("最近做完：", [self.job_line(j) for j in recent])):
             if group:
-                lines += [title] + [f"  {self.job_line(j)}" for j in group]
+                lines += [title] + [f"  {x}" for x in group]
         return "\n".join(lines)
+
+    def busy_text(self, chat_id) -> str:
+        """給模型看的「現在手上有什麼」：前景在跑的、背景工作。"""
+        bits = [self.fg_line(w) for w in self.inflight(chat_id)]
+        bits += [f"背景工作『{j['name']}』{j['status']}：{self.orch.describe(j)}" for j in self.jobs.of(chat_id, ACTIVE)]
+        return ("進行中：" + "；".join(bits) + "\n") if bits else ""
 
     def session_kb(self, chat_id: int) -> int:
         sid = self.state.sid(chat_id)
@@ -743,6 +802,7 @@ class Bridge:
         if cmd in ("/new", "/reset"):
             self.state.d["summary"].pop(str(chat_id), None)
             self.state.d.get("fresh", {}).pop(str(chat_id), None)
+            self.convo.clear(chat_id)
             sid = self.state.new_session(chat_id)
             return t(self.lang_for(chat_id), "new_chat") + f" ({sid})"
         if cmd == "/compact" and is_owner:
@@ -800,20 +860,24 @@ class Bridge:
         return f"未知指令 '{cmd}'。\n" + HELP_TEXT
 
     def stop(self, chat_id: int, name: str) -> str:
-        act = self.jobs.of(chat_id, ACTIVE)
+        act, fg = self.jobs.of(chat_id, ACTIVE), self.inflight(chat_id)
         if name:
+            w = next((w for w in reversed(fg) if name in w["label"] or w["label"] in name), None)
+            if w:
+                return self._stop_fg(w)
             j = self.jobs.find(chat_id, name, act)
             return self._stop_job(j) if j else f"沒有進行中的『{name}』。\n" + self.jobs_text(chat_id)
-        with self.mu:
-            fg = self.fg.get(chat_id)
         if fg:
-            fg.kill()
-            return "已中止目前處理。"
+            return self._stop_fg(fg[-1])
         if len(act) == 1:
             return self._stop_job(act[0])
         if len(act) > 1:
             return "要停哪一件？回 /stop <名稱>：\n" + "\n".join(f"  『{j['name']}』" for j in act)
         return "沒有進行中的處理。"
+
+    def _stop_fg(self, w: dict) -> str:
+        w["handle"].kill()
+        return f"好，『{w['label']}』停下了。"
 
     def _stop_job(self, j: dict) -> str:
         self.orch.stop(j)
@@ -888,15 +952,30 @@ class Bridge:
         self.dispatch(chat_id, uid == self.owner, mode, text or "請看這張圖片。", files, m.get("message_id"), uid)
 
     def dispatch(self, chat_id, is_owner: bool, mode: str, text: str, files: list, msg_id, uid) -> bool:
-        """Telegram 與 LINE 共用的入口：斜線指令即時處理（回 True），其餘每則各開一條執行緒（輪詢/webhook 永遠不被卡住）。"""
+        """Telegram 與 LINE 共用的入口：斜線指令即時處理（回 True）；其餘先進合併佇列，
+        幾秒內的連發合成一則，再開一條執行緒處理（輪詢/webhook 永遠不被卡住）。"""
         if text.startswith("/"):
             reply = self.command(text, chat_id, uid, is_owner)
             if reply is not None:
                 self.tg.send(chat_id, reply, msg_id)
                 return True
         log.info("inbound chat=%s mode=%s len=%d files=%d", chat_id, mode, len(text), len(files))
-        threading.Thread(target=self.process_message, args=(chat_id, uid, mode, text, files, msg_id), daemon=True).start()
+        item = {"chat_id": chat_id, "uid": uid, "mode": mode, "text": text, "files": files, "msg_id": msg_id}
+        if DEBOUNCE <= 0:
+            threading.Thread(target=self._flush_inbox, args=([item],), daemon=True).start()
+            return False
+        threading.Thread(target=self.tg.typing, args=(chat_id,), daemon=True).start()   # 合併等待期間也讓他看到「輸入中」
+        self.inbox.push((chat_id, uid), item, DEBOUNCE)
         return False
+
+    def _flush_inbox(self, items: list):
+        texts = [i["text"] for i in items if i["text"]]
+        if len(texts) > 1:
+            texts = [x for x in texts if x != "請看這張圖片。"] or texts
+            log.info("merged %d messages chat=%s", len(items), items[-1]["chat_id"])
+        last = items[-1]
+        self.process_message(last["chat_id"], last["uid"], last["mode"], "\n".join(texts),
+                             [f for i in items for f in i["files"]], last["msg_id"])
 
     # ------------------------------------------------------------ LINE
     def handle_line_event(self, ev: dict):
@@ -941,90 +1020,112 @@ class Bridge:
         self.dispatch(chat_id, is_owner, mode, text or "請看這張圖片。", files, None, uid)
 
     # ------------------------------------------------------------ routing（多線）
-    def process_message(self, chat_id, uid, mode, text, files, msg_id):
+    def process_message(self, chat_id, uid, mode, text, files, msg_id, record=True):
         try:
+            if record:
+                self.convo.add(chat_id, "u", text)
+            with self.mu:
+                self.last_sent.pop(chat_id, None)                     # 他又問了一次 → 同樣的答案也要再給
             if mode == "owner" and self.route(chat_id, text, files, msg_id):
                 return
             self.foreground(chat_id, uid, mode, text, files, msg_id)
         except Exception:
             log.exception("process_message failed")
-            self.tg.send(chat_id, "（我這邊出了點狀況，這則沒處理成，請再傳一次）", msg_id)
+            self.send(chat_id, "（我這邊出了點狀況，這則沒處理成，請再傳一次）", msg_id)
 
     def route(self, chat_id: int, text: str, files: list, msg_id) -> bool:
-        """有背景工作在跑（或在等他回答）時，先判斷這則是誰的。回 True＝已處理。"""
-        pend = self.pending.pop(chat_id, None)
-        if pend and time.time() - pend["ts"] < 1800:
-            if re.match(r"^\s*(加|併|加進|加入|併進|併入)", text):
-                j = self.jobs.find(chat_id, pend["jobs"][0], self.jobs.of(chat_id, ACTIVE))
-                if j:
-                    self._addto(j, pend["text"], pend["files"], chat_id, msg_id)
-                    return True
-            elif re.match(r"^\s*(新|另開|新的)", text):
-                threading.Thread(target=self.process_pending_as_new, args=(chat_id, pend, msg_id), daemon=True).start()
-                return True
-            else:                                              # 沒回答選項 → 當初那則照新事處理，這則正常往下走
-                threading.Thread(target=self.process_pending_as_new, args=(chat_id, pend, None), daemon=True).start()
+        """有事在跑（前景這一則或背景工作）或在等他回答時，先判斷這則是誰的。回 True＝已處理。
+        不反問、不排隊：問進度/喊停直接處理；同一件的催促/補充接到那件上；其餘當新的事平行跑。"""
         act = self.jobs.of(chat_id, ACTIVE)
         waiting = self.jobs.of(chat_id, ("被擋住",), awaiting=True)
-        if not (act or waiting):
+        fg = self.inflight(chat_id)
+        if not (act or waiting or fg):
             return False
         if len(text) <= 40 and STATUS_RE.search(text):
-            self.tg.send(chat_id, self.jobs_text(chat_id), msg_id)
+            self.send(chat_id, self.jobs_text(chat_id), msg_id)
             return True
-        if len(text) <= 40 and STOP_RE.search(text) and act:
-            j = self.jobs.find(chat_id, text, act) or (act[0] if len(act) == 1 else None)
+        if len(text) <= 40 and (STOP_RE.search(text) or STOP_SHORT.fullmatch(text)) and (act or fg):
+            j = self.jobs.find(chat_id, text, act) if act else None
             if j:
-                self.tg.send(chat_id, self._stop_job(j), msg_id)
+                self.send(chat_id, self._stop_job(j), msg_id)
+            elif len(fg) + len(act) == 1:
+                self.send(chat_id, self._stop_fg(fg[0]) if fg else self._stop_job(act[0]), msg_id)
             else:
-                self.tg.send(chat_id, "要停哪一件？\n" + "\n".join(f"  『{x['name']}』" for x in act) + "\n回「/stop 名稱」。", msg_id)
+                names = [w["label"] for w in fg] + [x["name"] for x in act]
+                self.send(chat_id, "要停哪一件？\n" + "\n".join(f"  『{n}』" for n in names) + "\n回「/stop 名稱」。", msg_id)
             return True
-        if len(waiting) == 1 and not act:                      # 只有一件在等答案：他的回覆多半就是答案，除非明顯無關
+        if len(waiting) == 1 and not act and not fg:           # 只有一件在等答案：他的回覆多半就是答案，除非明顯無關
             r = self.llm_json(
                 'Judge whether the new message answers the pending question (answer) or is a different matter (other). '
                 'The user may write Chinese or English. Output one JSON object only: {"route":"answer"} or {"route":"other"}',
-                f"待答：{waiting[0]['note']}\n新訊息：{text}", 40)
+                self.recent_text(chat_id, text) + f"待答：{waiting[0]['note']}\n新訊息：{text}", 40)
             if (r or {}).get("route", "answer") == "answer":
                 self.orch.resume(waiting[0], answer=text + "".join(f"（附檔：{f}）" for f in files))
-                self.tg.send(chat_id, f"收到，我接著做『{waiting[0]['name']}』。", msg_id)
+                self.send(chat_id, f"收到，我接著做『{waiting[0]['name']}』。", msg_id)
                 return True
             return False
-        pool = act + waiting
-        listing = "\n".join(f"{i + 1}. 名稱：{j['name']}｜目標：{short(j['goal'], 60)}" for i, j in enumerate(pool))
+        pool = [("fg", w) for w in fg] + [("job", j) for j in act + waiting]
+        listing = "\n".join(f"{i}. 『{w['label']}』｜處理中｜目標：{short(w['text'], 60)}" if kind == "fg"
+                            else f"{i}. 『{w['name']}』｜{w['status']}｜目標：{short(w['goal'], 60)}"
+                            for i, (kind, w) in enumerate(pool, 1))
         r = self.llm_json(
-            "Classify the new message. The user may write Chinese or English. Output one JSON object only, English keys:\n"
-            '{"route":"addto","job":"<name>"}  = it amends, narrows, or answers that job\n'
-            '{"route":"other"}  = unrelated chat, a question, or a new task\n'
-            '{"route":"unclear"}  = it might be either', f"進行中的事：\n{listing}\n\n新訊息：{text}", 60)
-        route = (r or {}).get("route", "other")
-        log.info("triage route=%s job=%s", route, (r or {}).get("job"))
-        if route == "addto":
-            j = self.jobs.find(chat_id, (r or {}).get("job", ""), pool) or (pool[0] if len(pool) == 1 else None)
-            if j:
-                self._addto(j, text, files, chat_id, msg_id)
-                return True
-            route = "unclear"
-        if route == "unclear":
-            names = [j["name"] for j in pool]
-            self.pending[chat_id] = {"text": text, "files": files, "jobs": names, "ts": time.time()}
-            self.tg.send(chat_id, f"這則是要加進『{names[0]}』，還是另外開一件？回「加」或「新」，我先不動。", msg_id)
+            "Some work is in progress for this user. Classify the new message against it, using the recent conversation. "
+            "The user may write Chinese or English. Output one JSON object only, English keys:\n"
+            '{"route":"same","item":N,"say":"..."}  = it repeats, confirms, or nudges item N and adds nothing new (查, 快點, 好, 對). '
+            "say: one short sentence in the user's language that item N is under way.\n"
+            '{"route":"addto","item":N}  = it adds to, narrows, corrects, or answers item N\n'
+            '{"route":"other"}  = a new question, a new task, or chat not about the items',
+            self.recent_text(chat_id, text) + f"進行中的事：\n{listing}\n\n新訊息：{text}", 120)
+        r = r if isinstance(r, dict) else {}
+        route = r.get("route", "other")
+        item = None
+        try:
+            item = pool[int(r.get("item")) - 1]
+        except (TypeError, ValueError, IndexError):
+            j = self.jobs.find(chat_id, str(r.get("job") or ""), act + waiting) if r.get("job") else None
+            item = ("job", j) if j else (pool[0] if len(pool) == 1 else None)
+        log.info("triage route=%s item=%s", route, item and item[0])
+        if route not in ("same", "addto") or not item:
+            return False
+        kind, w = item
+        if route == "same":
+            label = w["label"] if kind == "fg" else w["name"]
+            self.send(chat_id, short(str(r.get("say") or ""), 120) or f"『{label}』正在處理，好了馬上給你。", msg_id, essential=False)
             return True
-        return False
-
-    def process_pending_as_new(self, chat_id, pend, msg_id):
-        self.foreground(chat_id, self.owner, "owner", pend["text"], pend["files"], msg_id)
+        if kind == "job":
+            self._addto(w, text, files, chat_id, msg_id)
+            return True
+        extra = text + "".join(f"（附檔：{f}）" for f in files)
+        with self.mu:
+            alive = any(x is w for x in self.fg.get(chat_id, []))
+            if alive:
+                w["extras"].append(extra)
+        if alive:
+            self.send(chat_id, f"好，記下了，『{w['label']}』一做完就接著處理這個。", msg_id, essential=False)
+            return True
+        if w.get("job"):                                       # 剛好轉成背景工作了 → 補充給那件
+            self._addto(w["job"], text, files, chat_id, msg_id)
+            return True
+        return False                                           # 剛好做完 → 當新的一則
 
     def _addto(self, j: dict, text: str, files: list, chat_id: int, msg_id):
         extra = text + "".join(f"（附檔：{f}）" for f in files)
         if j["status"] == "被擋住":                                # 在等他回答 → 直接接續
             self.orch.resume(j, answer=extra)
-            self.tg.send(chat_id, f"收到，我接著做『{j['name']}』。", msg_id)
+            self.send(chat_id, f"收到，我接著做『{j['name']}』。", msg_id)
             return
         ctrl = self.orch.get(j["id"])
         if ctrl:
             ctrl.supplements.append(extra)
-            self.tg.send(chat_id, f"好，已加進『{j['name']}』，做完手上這步就照新的要求調整。", msg_id)
+            self.send(chat_id, f"好，已加進『{j['name']}』，做完手上這步就照新的要求調整。", msg_id)
         else:
-            self.tg.send(chat_id, f"『{j['name']}』目前沒在執行（{j['status']}），先 /resume 再補充。", msg_id)
+            self.send(chat_id, f"『{j['name']}』目前沒在執行（{j['status']}），先 /resume 再補充。", msg_id)
+
+    def recent_text(self, chat_id, text: str, n: int = CTX_TURNS) -> str:
+        """給快速模型與分流用的前文：最近幾則對話＋手上在跑的事。正在處理的這則不算前文。"""
+        rows = self.convo.recent(chat_id, n, skip=text)
+        body = ("最近對話（舊→新）：\n" + self.convo.render(rows, 240) + "\n") if rows else ""
+        return body + self.busy_text(chat_id)
 
     def owner_brief(self) -> str:
         """Private facts for this install. Missing file means nothing extra. Not a search."""
@@ -1034,14 +1135,16 @@ class Bridge:
             return ""
         return text[:1500]
 
-    def first_words(self, text: str, ep: dict) -> tuple[str, bool, bool]:
+    def first_words(self, text: str, ep: dict, chat_id=None) -> tuple[str, bool, bool]:
         """Fast model speaks first. Returns (say, work, know).
 
         work is false when the note or the private brief already answers.
         A claim of ignorance does not count as an answer: the main model still works.
         A down fast model means work, and no opening line.
+        With chat_id it also sees the recent conversation, so 查 / 好 / 那明天呢 continue the last request.
         """
         brief = self.owner_brief()
+        recent = self.recent_text(chat_id, text, 6) if chat_id is not None else ""
         direct = _direct_reply(text or "", brief, str(ep.get("model") or ""))
         if direct and not (ACTION_RE.search(text or "") and not direct[1]):
             return direct
@@ -1056,9 +1159,13 @@ class Bridge:
             "If they ask who they are, or where a project or page is, answer from the known-facts block, including its path and URL. "
             "Never say you do not know the user, or that you have not seen a project the block names. "
             "Do not quote their message. Do not mention shell commands or 我來處理. "
-            "Do not invent facts that are not in the note or the known-facts block.\n" + RULE,
+            "Do not invent facts that are not in the note or the known-facts block.\n"
+            "The recent conversation, when given, comes before the message. Read a short message (查, 好, 那明天呢) as continuing it; "
+            "do not ask what they mean when the conversation already says.\n"
+            "When work is true, say names the first concrete step in a few words, e.g. 我先看今天的行事曆. Do not promise a result.\n" + RULE,
             self.turn_model_note(ep)
             + (("已知：\n" + brief + "\n") if brief else "")
+            + recent
             + "使用者：\n" + (text or ""),
             max_tokens=200, timeout=20, tier="fast", temperature=0.7)
         m = re.search(r"\{.*\}", raw or "", re.S)
@@ -1093,95 +1200,126 @@ class Bridge:
         elif not work and ACTION_RE.search(text or "") and not _MODEL_RE.search(text or "") \
                 and not re.search(r"請.{0,40}(給我|貼上|提供|傳給我)|could you (send|paste|share)", say):
             work = True                           # 可執行的請求不讓小模型自己擋掉
+        elif not work and re.search(r"[？?]\s*$", say) and self._followup(chat_id, text):
+            say, work = "", True                  # 短追問被反問（「查什麼呢？」）：前文已經說了要做什麼 → 交主模型
         return say, work, know
 
+    def _followup(self, chat_id, text: str) -> bool:
+        """很短的一句，且十分鐘內上一則是要做事的請求 → 是在接那件事。"""
+        if chat_id is None or len((text or "").strip()) > 8:
+            return False
+        prev = self.convo.last_user(chat_id, skip=text)
+        return bool(prev and time.time() - prev["ts"] < 600 and ACTION_RE.search(prev["text"]))
+
     # ------------------------------------------------------------ 前景一則（小模型先說；要做的交給主模型。超過兩輪交給 orchestrator）
-    def foreground(self, chat_id, uid, mode, text, files, msg_id):
-        lock = self.chat_locks.setdefault(chat_id, threading.Lock())     # 同一聊天的前景共用一個 session 檔，一次一則
-        if lock.locked():
-            self.tg.send(chat_id, "前一件還在處理，做完就接著處理你這則。", msg_id, essential=False)
-        with lock:
-            sid = self.pick_sid(chat_id)
-            prompt = self.build_prompt(chat_id, mode, text)
-            know = False
-            if mode == "owner":
-                voice_ep = self._endpoint("main")
-                say, work, know = self.first_words(text, voice_ep)
-                if say:
-                    self.tg.send(chat_id, say, msg_id, essential=not work)
-                if not work:
-                    return
-                if know:
-                    prompt += (
-                        "\nThe user is asking what you already know. Answer from prior context and this turn. "
-                        "Do not scan the home directory.\n"
-                    )
-            handle, stop = pirun.Handle(), threading.Event()
-            with self.mu:
-                self.fg[chat_id] = handle
-            threading.Thread(target=self._typing, args=(chat_id, stop), daemon=True).start()
-            t0 = time.time()
-
-            def on_round(said, calls, n):
-                if n >= PROMOTE_AT and mode == "owner":
-                    return "abort"
-
-            knobs = self.tune()
-            ep = self._endpoint("main")
-            provider, model = self._pi_pair(ep)
-            log.info("foreground start chat=%s provider=%s model=%s", chat_id, provider, model)
-            spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
-                              files=files, mode=mode, chat_prompt=self.turn_model_note(ep) + CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
-                              wall=int(knobs["fg_wall"]), stall=int(knobs["tool_stall"]),
-                              max_ctx=int(float(knobs["compact_at"]) * 2.2), first_token=first_token_s(ep.get("provider"), self.env))
-            attempt, notified = 0, False
-            try:
-                while True:
-                    with self.slots:
-                        r = pirun.run(spec, handle, on_round)
-                    why = fallback_reason(ep.get("provider"), r.kind, r.text, r.rounds)
-                    if why:
-                        self._note_fallback(ep, why, r)
-                        self._use_local_pi(spec)
-                        ep = {"provider": "local", "model": spec.alias}
-                        spec.prompt = self.turn_model_note(ep) + prompt
-                        spec.chat_prompt = self.turn_model_note(ep) + CHAT_ONLY_PROMPT
-                        continue
-                    if r.kind == "error" and TRANSIENT.search(r.text) and attempt < len(RETRY_WAITS):
-                        if not notified:
-                            self.tg.send(chat_id, t(self.lang_for(chat_id, text), "retry"), essential=False)
-                            notified = True
-                        if handle.cancel.wait(RETRY_WAITS[attempt]):
-                            return
-                        spec.prompt = self.turn_model_note(ep) + ("（連線剛才中斷，請接續剛才的任務。）" if r.rounds else prompt)
-                        attempt += 1
-                        continue
-                    break
-            finally:
-                stop.set()
-                with self.mu:
-                    if self.fg.get(chat_id) is handle:
-                        self.fg.pop(chat_id, None)
-            self.last_turn = f"{time.time() - t0:.0f}s"
-            log.info("foreground done chat=%s kind=%s provider=%s model=%s %s", chat_id, r.kind, spec.provider, spec.alias, self.last_turn)
-            if r.kind == "cancelled":
+    def foreground(self, chat_id, uid, mode, text, files, msg_id, opener=True):
+        """小模型先說話（不排隊，長工作進行中也即時回）；要動手的才開 pi。
+        主 session 空著就用主 session；正在用 → 這則開平行 session（帶最近對話），不回「前一件還在處理」。"""
+        know = False
+        if mode == "owner" and opener:
+            say, work, know = self.first_words(text, self._endpoint("main"), chat_id)
+            if say:
+                self.send(chat_id, say, msg_id, essential=not work)
+            if not work:
                 return
+        lock = self.chat_locks.setdefault(chat_id, threading.Lock())     # 主 session 檔一次只給一則用
+        side = not lock.acquire(blocking=False)
+        try:
+            extras = self._turn(chat_id, uid, mode, text, files, msg_id, know, side)
+        finally:
+            if not side:
+                lock.release()
+        if extras:                                                       # 做的時候他補充的話：接著在主 session 處理
+            self.foreground(chat_id, uid, mode, "補充（接著剛才那件）：\n" + "\n".join(extras), [], None, opener=False)
+
+    def _turn(self, chat_id, uid, mode, text, files, msg_id, know, side) -> list:
+        """跑一則前景。回傳做的時候他補充、還沒處理的話（被停掉、轉背景或失敗就是空的）。"""
+        sid = f"side-{chat_id}-{uuid.uuid4().hex[:6]}" if side else self.pick_sid(chat_id)
+        prompt = self.build_prompt(chat_id, mode, text, side)
+        if know:
+            prompt += (
+                "\nThe user is asking what you already know. Answer from prior context and this turn. "
+                "Do not scan the home directory.\n"
+            )
+        handle, stop = pirun.Handle(), threading.Event()
+        first = re.split(r"[，。,.；;：:！!？?\n]", re.sub(r"[「」『』]", "", text).strip())[0]
+        work = {"label": short(first, 14).rstrip("…") or "這則", "text": text, "started": time.time(),
+                "handle": handle, "extras": [], "side": side, "job": None}
+
+        def on_round(said, calls, n):
+            if n >= PROMOTE_AT and mode == "owner":
+                return "abort"
+
+        knobs = self.tune()
+        ep = self._endpoint("main")
+        provider, model = self._pi_pair(ep)
+        log.info("foreground start chat=%s side=%s provider=%s model=%s", chat_id, side, provider, model)
+        spec = pirun.Spec(self.pi, provider, model, sid, self.turn_model_note(ep) + prompt, SESSIONS_DIR, DATA, skills=skills_for(text, SKILLS_DIR),
+                          files=files, mode=mode, chat_prompt=self.turn_model_note(ep) + CHAT_ONLY_PROMPT, chat_cwd=CHAT_CWD,
+                          wall=int(knobs["fg_wall"]), stall=int(knobs["tool_stall"]),
+                          max_ctx=int(float(knobs["compact_at"]) * 2.2), first_token=first_token_s(ep.get("provider"), self.env))
+        attempt, notified, t0 = 0, False, time.time()
+        with self.mu:
+            self.fg.setdefault(chat_id, []).append(work)
+        threading.Thread(target=self._typing, args=(chat_id, stop), daemon=True).start()
+        try:
+            while True:
+                with self.slots:
+                    r = pirun.run(spec, handle, on_round)
+                why = fallback_reason(ep.get("provider"), r.kind, r.text, r.rounds)
+                if why:
+                    self._note_fallback(ep, why, r)
+                    self._use_local_pi(spec)
+                    ep = {"provider": "local", "model": spec.alias}
+                    spec.prompt = self.turn_model_note(ep) + prompt
+                    spec.chat_prompt = self.turn_model_note(ep) + CHAT_ONLY_PROMPT
+                    continue
+                if r.kind == "error" and TRANSIENT.search(r.text) and attempt < len(RETRY_WAITS):
+                    if not notified:
+                        self.send(chat_id, t(self.lang_for(chat_id, text), "retry"), essential=False)
+                        notified = True
+                    if handle.cancel.wait(RETRY_WAITS[attempt]):
+                        return []
+                    spec.prompt = self.turn_model_note(ep) + ("（連線剛才中斷，請接續剛才的任務。）" if r.rounds else prompt)
+                    attempt += 1
+                    continue
+                break
+            self.last_turn = f"{time.time() - t0:.0f}s"
+            log.info("foreground done chat=%s side=%s kind=%s provider=%s model=%s %s", chat_id, side, r.kind, spec.provider, spec.alias, self.last_turn)
+            if r.kind == "cancelled":
+                return []
             if r.kind in ("aborted", "loop", "stalled", "too_long", "timeout", "ctx_full") and mode == "owner":
                 if know or KNOW_RE.search(text or ""):
                     self.answer_known(chat_id, text, r.trace, msg_id)       # 問認不認識、了解到哪：依這輪看到的答，不開搜尋工作
-                    return
-                self.promote(chat_id, text, sid, r.trace)                  # 這件比想像大 → 交給 orchestrator，聊天立刻空出來
-                return
+                    return []
+                self.promote(chat_id, text, sid, r.trace, work)            # 這件比想像大 → 交給 orchestrator，聊天立刻空出來
+                return []
             if r.kind == "final":
-                self.tg.send(chat_id, r.text, msg_id)
-                if r.ctx_tokens > int(self.tune()["compact_at"]):             # 回完話之後再壓，不讓他等
+                self.send(chat_id, r.text, msg_id, via="" if side else "main")
+                if not side and r.ctx_tokens > int(self.tune()["compact_at"]):   # 回完話之後再壓，不讓他等
                     self.compact_chat(chat_id, sid, r.ctx_tokens)
-            elif r.kind == "error" and TRANSIENT.search(r.text):
+                return self._done_work(chat_id, work)
+            if r.kind == "error" and TRANSIENT.search(r.text):
                 self.defer(chat_id, uid, mode, text, files, msg_id)
             elif r.kind == "empty":
-                self.tg.send(chat_id, "（模型沒有產生回覆，換個說法或 /new 後再試一次）", msg_id)
+                self.send(chat_id, "（模型沒有產生回覆，換個說法或 /new 後再試一次）", msg_id)
             else:
-                self.tg.send(chat_id, f"（沒處理成：{short(r.text or r.kind, 200)}）", msg_id)
+                self.send(chat_id, f"（沒處理成：{short(r.text or r.kind, 200)}）", msg_id)
+            return []
+        finally:
+            stop.set()
+            self._done_work(chat_id, work)
+
+    def _done_work(self, chat_id, work: dict) -> list:
+        """前景這一則收尾：從登錄拿掉，交回還沒處理的補充（只交一次）。"""
+        with self.mu:
+            left = [w for w in self.fg.get(chat_id, []) if w is not work]
+            if left:
+                self.fg[chat_id] = left
+            else:
+                self.fg.pop(chat_id, None)
+            extras, work["extras"] = work["extras"], []
+        return extras
 
     def answer_known(self, chat_id, text, trace, msg_id):
         seen = "\n".join(
@@ -1195,22 +1333,32 @@ class Bridge:
             "Use the user's language.",
             f"問題：{text}\n這輪實際看到的：\n{seen}",
             max_tokens=400, timeout=45, tier="fast")
-        self.tg.send(chat_id, reply or "我手上這輪沒有足夠的紀錄可以答。你指定一個目錄，我再看那個目錄。", msg_id)
+        self.send(chat_id, reply or "我手上這輪沒有足夠的紀錄可以答。你指定一個目錄，我再看那個目錄。", msg_id)
 
-    def promote(self, chat_id, text, sid, trace):
+    def promote(self, chat_id, text, sid, trace, work: dict | None = None):
+        """轉背景工作。開始／進度／完成的訊息由 orchestrator 送（同一則原地更新）；做的時候他補充的話轉成這件的補充。"""
         first = re.split(r"[，。,.；;：:！!？?\n]", re.sub(r"[「」『』]", "", text).strip())[0]
         name = short(first, 10).rstrip("…") or "任務"                         # 暫名；規劃完成後由模型取短名取代
         job = self.jobs.add(chat_id, name, text, sid)
-        self.state.new_session(chat_id)                                    # 前景聊天換新 session，舊的留給這件工作的前情
-        self.tg.send(chat_id, "這件要多做幾步，我先拆一下步驟再動手；你可以繼續聊別的，做完我直接跟你說。", essential=False)
-        self.orch.start(job, trace=trace)
+        if len(text) <= 30:                                                # 短句（「那明天呢」）單看不懂：附最近對話給規劃與每一步
+            ctx = self.convo.render(self.convo.recent(chat_id, 6, skip=text), 200)
+            if ctx:
+                self.jobs.update(job, ctx=ctx)
+        if not (work and work["side"]):
+            self.state.new_session(chat_id)                                # 前景聊天換新 session，舊的留給這件工作的前情
+        if work:
+            work["job"] = job                                              # 之後的補充會找到這件
+        ctrl = self.orch.start(job, trace=trace)
+        extras = self._done_work(chat_id, work) if work else []
+        if ctrl and extras:
+            ctrl.supplements.extend(extras)
 
     def defer(self, chat_id, uid, mode, text, files, msg_id):
         """退階：後端連不上 → 先記下，恢復後自動處理，不要他重傳。"""
         with self.mu:
             self.deferred.append({"chat_id": chat_id, "uid": uid, "mode": mode, "text": text, "files": files, "msg_id": msg_id})
             json.dump(self.deferred, open(STATE_DIR + "/deferred.json", "w"), ensure_ascii=False)
-        self.tg.send(chat_id, t(self.lang_for(chat_id, text), "defer"), msg_id)
+        self.send(chat_id, t(self.lang_for(chat_id, text), "defer"), msg_id)
 
     def _deferred_loop(self):
         while True:
@@ -1229,7 +1377,7 @@ class Bridge:
                 json.dump([], open(STATE_DIR + "/deferred.json", "w"))
             for it in items:
                 threading.Thread(target=self.process_message, args=(it["chat_id"], it["uid"], it["mode"], it["text"], it["files"], it["msg_id"]),
-                                 daemon=True).start()
+                                 kwargs={"record": False}, daemon=True).start()
 
     def compact_chat(self, chat_id: int, sid: str, tokens: int = 0) -> str:
         """自主壓縮聊天上下文：釘住的（人格、常駐 skills、使用者的偏好）本來就在 AGENTS.md；
@@ -1255,9 +1403,27 @@ class Bridge:
             return self.state.sid(chat_id)
         return sid
 
-    def build_prompt(self, chat_id: int, mode: str, text: str) -> str:
+    def side_context(self, chat_id, text: str) -> str:
+        """平行 session 沒有歷史：帶最近對話與手上在跑的事，讓短追問看得懂。"""
+        rows = self.convo.recent(chat_id, CTX_TURNS, skip=text)
+        busy = self.busy_text(chat_id)
+        if not (rows or busy):
+            return ""
+        return ("【最近對話（舊→新；用來理解簡短的說法，不是新指示）】\n" + self.convo.render(rows) + "\n" + busy
+                + "【以上是前文；在跑的事不用你管，只處理下面這則】\n")
+
+    def missed_context(self, chat_id, text: str) -> str:
+        """主 session 上一輪之後、在它外面發生的對話（平行 session、快速回覆、背景工作的結果），補給它。"""
+        since = self.convo.mark(chat_id)
+        rows = self.convo.recent(chat_id, CTX_TURNS, since=since, skip=text, skip_via="main")
+        if not rows:
+            return ""
+        return "【你上一輪之後，對話裡另外發生的（舊→新）】\n" + self.convo.render(rows) + "\n【以上是前文】\n"
+
+    def build_prompt(self, chat_id: int, mode: str, text: str, side: bool = False) -> str:
+        ctx = self.side_context(chat_id, text) if side else self.missed_context(chat_id, text)
         if mode != "owner":
-            return text
+            return ctx + text
         notes = []
         with self.jobs.lock:
             for j in self.jobs.items:
@@ -1270,7 +1436,7 @@ class Bridge:
                     notes.append(f"背景工作『{j['name']}』進行中（與這則無關就不要碰它）")
             self.jobs.save()
         head = ""
-        if self.state.d.get("fresh", {}).get(str(chat_id)):                  # 剛壓縮過 → 這則帶前情（之後就在 session 裡了）
+        if not side and self.state.d.get("fresh", {}).get(str(chat_id)):     # 剛壓縮過 → 這則帶前情（之後就在 session 裡了）
             head = ("【前情摘要（上下文已壓縮；以此接續，方向以此為準）】\n" + self.state.d["summary"].get(str(chat_id), "")
                     + "\n【最近幾則對話原文】\n" + self.state.d.get("recent", {}).get(str(chat_id), "") + "\n【以上為前情，下面是新訊息】\n")
             self.state.d["fresh"][str(chat_id)] = False
@@ -1286,7 +1452,7 @@ class Bridge:
         )
         brief = self.owner_brief()
         known = ("已知（這些路徑與網址是真的，可以直接說）：\n" + brief + "\n") if brief else ""
-        return head + (("（" + "；".join(notes) + "）\n") if notes else "") + align + known + text
+        return head + ctx + (("（" + "；".join(notes) + "）\n") if notes else "") + align + known + text
 
     def _typing(self, chat_id, stop):
         while not stop.is_set():
@@ -1299,10 +1465,10 @@ class Bridge:
         for j in [x for x in self.jobs.items if x["status"] in ACTIVE]:
             if j.get("resumes", 0) >= 3:
                 self.jobs.update(j, status="被擋住", note="反覆被中斷，先停下；/resume 再試")
-                self.tg.send(j["chat_id"], f"『{j['name']}』被中斷好幾次了，我先停下來，你說一聲我再接。（/resume {j['name']}）")
+                self.send(j["chat_id"], f"『{j['name']}』被中斷好幾次了，我先停下來，你說一聲我再接。（/resume {j['name']}）")
                 continue
             self.orch.resume(j, auto=True)
-            self.tg.send(j["chat_id"], f"我這邊剛重啟過，『{j['name']}』接著剛才的進度繼續做（{self.orch.describe(j)}）。")
+            self.send(j["chat_id"], f"我這邊剛重啟過，『{j['name']}』接著剛才的進度繼續做（{self.orch.describe(j)}）。")
 
     def run(self):
         threading.Thread(target=self._deferred_loop, daemon=True).start()
