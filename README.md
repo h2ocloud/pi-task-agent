@@ -10,7 +10,7 @@ A small local model is allowed to take longer and use more steps. The job still 
 - **Loaded on demand.** Default `PITG_SKILLS=ondemand`. Skills marked `always: true` are always included. Others load only when the message shares keywords with the name, description, or `triggers` (Chinese two-character overlap, so「查天氣」matches「天氣」). Cap is `PITG_SKILL_LIMIT` (default 3). `PITG_SKILLS=all` loads the whole directory. `off` loads none. pi is started with `--no-skills` plus one `--skill` per selected directory, so it does not discover everything else on the machine.
 - **Compresses its own context.** Chat history past `PITG_COMPACT_AT` tokens (default 40000) is summarized. The original goal and the user's explicit requirements stay verbatim (pins). Paths, URLs, and ids dropped by the summary are put back by a regex, not by the model. If the compactor fails, the fallback is the recent messages plus those anchors.
 - **Stays aligned.** Every step is a fresh session that repeats the original goal. The planner is not told to assume hosts, accounts, or directories. A finished step that cites a path or URL absent from the goal, the pins, and the tool trace is rejected and retried. The checker model can also reject a step that missed its done-condition. If that checker itself fails, the step is kept — see limits below.
-- **Finishes.** Two tries, then the step is split (depth 3). A stuck tool is killed; the run continues. Context overflow compacts and resumes (up to 3 times) instead of failing the job. The whole job has a 3-hour cap. What cannot be done is skipped and reported. Only a real block (password, permission, an explicit decision) stops to ask.
+- **Finishes.** Two tries, then the step is split, one level deep (1.1, never 1.1.1). A stuck tool is killed; the run continues. Context overflow compacts and resumes (up to 3 times) instead of failing the job. The whole job has a 3-hour cap. What cannot be done is skipped and reported. Only a real block (password, permission, an explicit decision) stops to ask.
 
 ## Layout
 
@@ -25,8 +25,10 @@ A small local model is allowed to take longer and use more steps. The job still 
 | `providers.py` | fast / main tiers, local server or Grok |
 | `lang.py` | Reply language follows the user (Traditional Chinese or English) |
 | `dashboard.py` | Loopback page for knobs, a short test prompt, and the log |
+| `mailgate.py` | Mail hard stop: draft only until the user confirms in the chat (`pitg-mail`) |
+| `tools/gog-guard` | The `gog` on pi's PATH: always `--gmail-no-send`, invite mail blocked |
 
-Behavior worth keeping when you change it: answer before the long work, move a task to the background after two tool rounds, four status words only (`開始了` / `還在跑` / `做完` / `被擋住`). Slowness is fine. Drifting is not.
+Behavior worth keeping when you change it: answer before the long work, move a task to the background at the sixth tool round (a lookup should finish in the foreground), four status words only (`開始了` / `還在跑` / `做完` / `被擋住`). Slowness is fine. Drifting is not.
 
 ## Run
 
@@ -60,7 +62,7 @@ Measured context sizes, temperatures, and the Grok prices are in [TUNING.md](TUN
 ## Limits
 
 - The step checker fails open. A broken checker does not block a job that reported a grounded result. The path/URL check does not fail open.
-- "Do not send mail or post messages" is in the step prompt. It is not a separate permission deny on the shell tool.
+- Mail is stopped at the tool layer, not by the prompt: `gog` on pi's PATH is `tools/gog-guard` (always `--gmail-no-send`), and `pitg-mail send` needs a draft the bridge approved after the user said 寄出 in the chat. A model that calls the real `gog` binary by absolute path, or the Gmail API from its own script, is not stopped. pi runs as your user; this is a guard against mistakes, not a sandbox.
 - Keyword skill selection misses a skill whose name and description never use the user's words. Put those words in `description` or `triggers`, or set `PITG_SKILLS=all`.
 
 ## Tests

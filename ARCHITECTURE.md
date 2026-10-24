@@ -16,16 +16,22 @@ A long chat on a local model drifts. The orchestrator therefore plans 1–6 conc
 1. The original goal, verbatim.
 2. The user's later requirements, verbatim (pins). The compactor is not allowed to rewrite them.
 3. A short digest of finished steps.
-4. The current step and its done-condition.
-5. An alignment block: do not assume machines, paths, or numbers that are not in the task or in a tool result; if this step is no longer the goal, stop and change approach.
+4. The intent: what the assistant itself said it would do before the turn moved to the background (the fast model's opener and the main model's last words). References such as 重複的, cc, 它 are resolved against it and the recent turns, not re-guessed.
+5. The previous step's raw tool output, clipped to about 2 KB, so a file list is not listed again and file names are copied, not made up.
+6. The current step and its done-condition.
+7. An alignment block: do not assume machines, paths, or numbers that are not in the task or in a tool result; do not redo what the last step already listed or read; do not use a file name that never appeared in tool output; if this step is no longer the goal, stop and change approach.
+
+A turn moves to the background at the sixth tool round (`PROMOTE_AT`). When the planner returns a single step, that step does not start a new session: it continues the foreground session (pi closes the interrupted tool call), so nothing already read is read again.
 
 That is the alignment mechanism. It is not a second model trained to be honest. It is the same model, given less room to invent, plus a check that does not trust it.
 
 ## Alignment check
 
-After a step returns a normal answer, `context.ungrounded` extracts paths and URLs from the answer. A claim is grounded only if it already appears in the goal, the pins, the digest, the step text, or the tool trace (a truncated trace path still counts when one is a prefix of the other). Anything else rejects the step. The next attempt is told the missing paths and told not to repeat the same command. Two failures and the step is split into smaller ones. At depth 3 it is skipped and the final report says so.
+After a step returns a normal answer, `context.ungrounded` extracts paths and URLs from the answer. A claim is grounded only if it already appears in the goal, the pins, the digest, the step text, or the tool trace (a truncated trace path still counts when one is a prefix of the other). Anything else rejects the step. The next attempt is told the missing paths and told not to repeat the same command. Two failures and the step is split into smaller ones, one level deep only (1.1, never 1.1.1). A sub-step that still fails is skipped and the final report says so.
 
 The checker model (`VERIFIER`) can also reject a step that missed `done_when` or answered a different task. If that call errors or returns nonsense, the step is accepted. The path check still applies.
+
+The final report is given the tool actions that actually ran. An instruction with no matching action is reported as not done; it is never echoed back as done. A mail that was only drafted is reported as a draft.
 
 The planner prompt does not list hosts, home directories, or services. Inventing that environment was a reliable way to make a local model hallucinate a successful run.
 
@@ -79,4 +85,4 @@ One path for Telegram and LINE (`convo.py`).
 
 Telegram long-polling, optional LINE webhook. LINE spends the free reply token first. Later pushes are only a job's start, the result, a block, or a question. Keyed progress is never pushed on LINE and never takes the reply token, so a long job costs two pushes. Under five pushes remaining, the other channel is used so the result is not dropped. Chat-only users get `--no-tools`.
 
-Outbound mail is a prompt rule on the step, not a shell deny-list. Treat that as a gap if you run this against an untrusted chat.
+Outbound mail is stopped in code. `gog` on pi's PATH is `tools/gog-guard`, which always adds gog's own `--gmail-no-send` (send, forward, drafts send, autoreply) and refuses calendar `--send-updates` other than `none`. The only way to send is `pitg-mail` (`mailgate.py`): `draft` stores the mail and prints it; `send --confirmed <id>` sends that stored text only if the bridge approved the draft, and the bridge approves only when the owner's own message says 寄出 (no 不/別/改/嗎) after the draft appeared. Foreground, side sessions and jobs all go through the same tools. A model that calls the real binary by absolute path is not stopped; pi runs as your user.

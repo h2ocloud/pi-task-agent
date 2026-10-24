@@ -43,9 +43,9 @@ def check(name, cond, info=""):
 env = Env(lambda sid, p, n, e: Result("final", f"步驟完成 /tmp/out{n}.txt", rounds=2, trace=[{"action": f"寫 /tmp/out{n}.txt", "result": "ok"}])); env.llm_handler = planner(["讀檔", "整理", "輸出"])
 job = mkjob(); run_job(env, job)
 check("1 normal: done + 3 pi runs", job["status"] == "做完" and len(env.calls) == 3, (job["status"], len(env.calls)))
-check("1 start said first, then the plan", env.sent and "多做幾步" in env.sent[0] and "拆成 3 步" in env.sent[1], env.sent[:2])
+check("1 start said first, then the plan", env.sent and "背景" in env.sent[0] and "拆成 3 步" in env.sent[1], env.sent[:2])
 ess = [m for m, e, k in env.meta if e]
-check("1 LINE budget: only start + done are essential; plan/milestones are keyed progress", len(ess) == 2 and "多做幾步" in ess[0] and ess[1].startswith("做完")
+check("1 LINE budget: only start + done are essential; plan/milestones are keyed progress", len(ess) == 2 and "背景" in ess[0] and ess[1].startswith("做完")
       and all(k == job["id"] for m, e, k in env.meta if not e) and sum("進行中 " in m for m, e, k in env.meta) == 3, env.meta)
 check("1 digest carries paths", "/tmp/out1.txt" in job.get("digest", "") and "/tmp/out3.txt" in job["digest"], job.get("digest"))
 check("1 goal pinned verbatim in every step prompt", all("整理九月發票" in c[1] for c in env.calls))
@@ -167,5 +167,55 @@ def s13(sid, p, n, e):
     return Result("final", "看到 /tmp/proj/readme.md", rounds=1, trace=[{"action": "find", "result": "…", "paths": "/tmp/proj/readme.md"}])
 env = Env(s13); env.llm_handler = planner(["看目錄"]); job = mkjob(); run_job(env, job)
 check("13 path kept beside the short trace is grounded", job["status"] == "做完" and "/tmp/proj/readme.md" in (job["plan"][0]["result"] or ""), job["plan"])
+
+# 14 只排出一步：不開新 session，沿用轉背景前的前景 session（job sid）接著做；帶意圖
+env = Env(lambda sid, p, n, e: Result("final", "明天有三個行程", rounds=1)); env.llm_handler = planner(["查明天行事曆"])
+job = mkjob("明天行事曆"); job["intent"] = "我先看明天的行事曆。"; run_job(env, job)
+check("14 single step continues the foreground session (no job-* session) with the continue prompt",
+      job["status"] == "做完" and [c[0] for c in env.calls] == ["x"] and "接著做完" in env.calls[0][1] and "我先看明天的行事曆" in env.calls[0][1], env.calls)
+
+# 15 多步：下一步帶上一步工具輸出原文（檔名照抄）＋意圖；不再鼓勵「多花幾步」
+def s15(sid, p, n, e):
+    if n == 1:
+        return Result("final", "列好了", rounds=1, trace=[{"action": "執行 `ls ~/.pi-tg/tmp`", "result": "costco-a.md costco-b.md",
+                                                           "out": "costco-a.md\ncostco-b.md\nnotes.txt"}])
+    return Result("final", "比對完：costco-b.md 是重複的", rounds=1)
+env = Env(s15); env.llm_handler = planner(["列出草稿", "比對重複"])
+job = mkjob("刪除重複的 Costco 草稿"); job["intent"] = "我先列出 Costco 的草稿檔。"; run_job(env, job)
+p2 = env.calls[1][1]
+check("15 step 2 sees step 1's raw tool output and the intent; no 'spend more steps'",
+      "costco-a.md\ncostco-b.md\nnotes.txt" in p2 and "我先列出 Costco 的草稿檔" in p2 and "可以多花幾步" not in O.STEP_PROMPT
+      and "沒在工具輸出裡出現過的檔名不得使用" in p2 and "不要重做" in p2, p2[:400])
+check("15 every step runs in its own job-* session when there are several", all(c[0].startswith("job-j1-") for c in env.calls), [c[0] for c in env.calls])
+
+# 16 拆小最多一層：1.1 可以；1.1 還做不起來就跳過，不會有 1.1.1
+def s16(sid, p, n, e): return Result("too_long", rounds=15) if "難" in p.split("這一步：")[1].split("\n")[0] or n == 1 else Result("final", "好", rounds=1)
+env = Env(s16)
+env.llm_handler = lambda system, user: ({"steps": [{"title": "難子1", "done_when": ""}, {"title": "難子2", "done_when": ""}]} if "太大或做不起來" in system
+                                        else planner(["難步驟", "簡單"])(system, user))
+job = mkjob(); run_job(env, job, timeout=60)
+ids = [x["id"] for x in job["plan"][0]["sub"]] + [y["id"] for x in job["plan"][0]["sub"] for y in x["sub"]]
+check("16 decompose at most one level (1.1 yes, 1.1.x never)", O.MAX_DEPTH == 1 and ids == ["1.1", "1.2"] and job["plan"][0]["status"] == "skipped"
+      and job["plan"][1]["status"] == "done", (ids, job["plan"]))
+
+# 17 回報：拿到實際工具動作清單，規則要求沒對應動作的指示說「沒做到」、不提內部字眼
+def s17(sid, p, n, e):
+    if "整理" in p.split("這一步：")[1].split("\n")[0]:
+        return Result("loop", rounds=3, trace=[{"action": "執行 `trash /tmp/x/dup.md`", "result": ""}])
+    return Result("final", "列好了", rounds=1, trace=[{"action": "執行 `ls /tmp/x`", "result": "a"}])
+env = Env(s17); env.llm_handler = planner(["列出", "整理"]); job = mkjob("列出並寄信給 Sammi")
+run_job(env, job, trace=[{"action": "執行 `gog calendar events --tomorrow`", "result": "3 events"}])
+rep = [x[2] for x in env.llm_log if x[0] == "text"][-1]
+check("17 reporter gets every tool action (foreground, done and failed steps) and is told to say 沒做到 for unmatched instructions",
+      "實際執行過的工具動作" in rep and "ls /tmp/x" in rep and "trash /tmp/x/dup.md" in rep and "gog calendar events" in rep and "沒做到" in O.REPORTER and "清單" in O.REPORTER and "session" in O.REPORTER
+      and "草稿" in O.REPORTER, rep[-300:])
+
+# 18 規劃：帶意圖與對話脈絡，規則要先解指代詞
+env = Env(lambda sid, p, n, e: Result("final", "好", rounds=1)); env.llm_handler = planner(["一步"])
+job = mkjob("刪除重複的＋cc 改 loop 進行程"); job["intent"] = "我先看 Costco 行程。"; job["ctx"] = "使用者：Costco 行程跟信都重複了"
+run_job(env, job)
+plan_in = [x[2] for x in env.llm_log if x[0] == "json" and "任務：" in x[2]][0]
+check("18 planner sees intent + recent turns and must resolve references first",
+      "我先看 Costco 行程" in plan_in and "Costco 行程跟信都重複了" in plan_in and "指代詞" in O.PLANNER and "不要把任務改成別件事" in O.PLANNER, plan_in)
 
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

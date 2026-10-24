@@ -75,6 +75,12 @@ def short(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def clip(s: str, n: int) -> str:
+    """跟 short 一樣截斷，但保留換行（檔案清單要一行一個才看得懂）。"""
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def parse_content(m: dict):
     c = m.get("content")
     texts, calls = [], []
@@ -152,7 +158,7 @@ class Result:
     kind: str                                   # final|error|empty|cancelled|timeout|loop|too_long|stalled|ctx_full|aborted|first_token
     text: str = ""
     rounds: int = 0
-    trace: list = field(default_factory=list)   # [{"action","result"}]：做過什麼（上層規劃時當前情）
+    trace: list = field(default_factory=list)   # [{"action","result","out"}]：做過什麼（上層規劃時當前情；out＝原文節錄）
     stalls: int = 0
     ctx_tokens: int = 0                         # 最後一次呼叫時的上下文大小（token）
 
@@ -194,7 +200,7 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
         cmd += ["--no-tools", "-ns", "-nc", "--system-prompt", spec.chat_prompt]
         cwd = spec.chat_cwd or spec.data
     cmd += ["@" + f for f in spec.files] + ["--", spec.prompt]
-    env = dict(os.environ, PI_OFFLINE="1", PATH=f"{spec.data}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+    env = dict(os.environ, PI_OFFLINE="1", PATH=f"{spec.data}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, bufsize=1, start_new_session=True)
     h.proc, h.rounds = proc, 0
@@ -289,6 +295,7 @@ def run(spec: Spec, h: Handle, on_round_start=None) -> Result:
         elif t == "message_end" and m.get("role") == "toolResult" and trace:
             full = parse_content(m)[0]
             trace[-1]["result"] = short(full, 160)
+            trace[-1]["out"] = clip(full, 1200)              # 原文節錄（保留換行）：下一步拿來當檔名與路徑的依據
             hints = path_hints(full)
             if hints:
                 trace[-1]["paths"] = hints

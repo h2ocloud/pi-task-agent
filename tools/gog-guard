@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# 助理（pi）PATH 裡的 gog（裝成 ~/.pi-tg/bin/gog）：一律帶 gog 內建的 --gmail-no-send，
+# 擋 send / forward / drafts send / autoreply（前面的比對只是為了給提示，真正擋的是這個旗標）；
+# 行程的 --send-updates 只准 none（all／externalOnly 會由 Google 寄通知信給參與者）。
+# 寄信只能走 pitg-mail：先出草稿，使用者在對話裡確認後才寄。
+REAL="${PITG_REAL_GOG:-/opt/homebrew/bin/gog}"
+hint="寄信請用：pitg-mail draft --to … --subject … --body …（只出草稿；使用者在對話裡說「寄出」後才用 pitg-mail send --confirmed <id> 寄）"
+prev=""
+for a in "$@"; do
+  case "$a" in
+    *gmail-no-send*) echo "不允許關掉 --gmail-no-send。$hint" >&2; exit 3 ;;
+    --send-updates=all|--send-updates=externalOnly)
+      echo "行程通知會寄信給參與者，這裡不能發。用預設 --send-updates=none（行程照樣建好）；要通知對方請先問使用者。" >&2; exit 3 ;;
+  esac
+  case "$prev:$a" in
+    --send-updates:all|--send-updates:externalOnly)
+      echo "行程通知會寄信給參與者，這裡不能發。用預設 --send-updates=none（行程照樣建好）；要通知對方請先問使用者。" >&2; exit 3 ;;
+    :send|gmail:send|mail:send|email:send|drafts:send|draft:send|gmail:forward|gmail:fwd|mail:forward|mail:fwd|email:forward|email:fwd|gmail:autoreply|mail:autoreply|email:autoreply)
+      echo "這裡不能直接寄信。$hint" >&2; exit 3 ;;
+  esac
+  prev="$a"
+done
+exec "$REAL" --gmail-no-send "$@"

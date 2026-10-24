@@ -48,12 +48,14 @@ check("B direct answer = exactly one message (no ack/dispatch)", len(msgs(OWNER,
 c = len(tg.sent); upd(OWNER, "用 bash 執行 echo pitg-ok，只回答輸出內容"); wait(lambda: len(msgs(OWNER, c)) >= 2, 200); m = msgs(OWNER, c)
 check("C tool turn: opening line is not a command announcement, answer is the output", m and m[-1].strip() == "pitg-ok" and not any("先執行" in t or "我來處理" in t for t in m), m)
 
-# D 長任務（強制要 ≥3 輪工具）：放背景 → 規劃 → 小步執行 → 做完；進行中仍可聊天、可查進度
+# D 長任務（強制要 ≥PROMOTE_AT 輪工具）：放背景 → 規劃 → 小步執行 → 做完；進行中仍可聊天、可查進度
 shutil.rmtree("/tmp/pitg_e2e", ignore_errors=True)
 c = len(tg.sent); t0 = time.time()
-upd(OWNER, "請分四次工具呼叫，每次只執行一個 bash 指令（不要合併）：先 mkdir -p /tmp/pitg_e2e，再 date > /tmp/pitg_e2e/d.txt，再 hostname > /tmp/pitg_e2e/h.txt，最後 cat /tmp/pitg_e2e/d.txt /tmp/pitg_e2e/h.txt。然後把結果用一句話回報給我。")
+upd(OWNER, "請分八次工具呼叫，每次只執行一個 bash 指令（不要合併）：先 mkdir -p /tmp/pitg_e2e，再 date > /tmp/pitg_e2e/d.txt，再 hostname > /tmp/pitg_e2e/h.txt，"
+           "再 whoami > /tmp/pitg_e2e/w.txt，再 uname -m > /tmp/pitg_e2e/u.txt，再 sw_vers -productVersion > /tmp/pitg_e2e/v.txt，再 ls /tmp/pitg_e2e，"
+           "最後 cat /tmp/pitg_e2e/d.txt /tmp/pitg_e2e/h.txt。然後把結果用一句話回報給我。")
 check("D ack first (what+first step)", wait(lambda: len(msgs(OWNER, c)) >= 1, 120) and len(msgs(OWNER, c)[0]) > 6, msgs(OWNER, c))
-promoted = wait(lambda: any("多做幾步" in t for t in msgs(OWNER, c)), 240)
+promoted = wait(lambda: any("轉到背景" in t for t in msgs(OWNER, c)), 240)
 check("D promoted to background (told user, chat freed)", promoted, msgs(OWNER, c))
 if promoted:
     c2 = len(tg.sent); upd(OWNER, "現在在忙什麼"); wait(lambda: len(tg.sent) > c2, 30)

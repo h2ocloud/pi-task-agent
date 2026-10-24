@@ -5,6 +5,8 @@
 還是不行就退階——換個做法重試 → 拆小 → 誠實跳過並在回報裡說明——整件事不因為一步失敗而報廢。
 只有「真的需要使用者」（密碼、授權、要他拍板）才停下來問，其餘一律自己想辦法。
 重啟、後端暫時離線都會自己接續。狀態全存在 job 記錄裡（jobs.json），隨時可接續。
+只排出一步的工作不開新 session：沿用轉背景前的前景 session（job["sid"]）接著做，前面列過、讀過的不重來。
+多步的話，每步帶「意圖」（轉背景前自己說要做的）與上一步工具輸出原文節錄，檔名照抄不重編。
 
 依賴（鴨子型別，方便測試）env 需提供：
   send(chat_id, text, essential=, key=)（key＝同一件工作的開始/進度，通道可原地更新同一則）· run_pi(job, sid, prompt, handle, max_rounds, wall) -> pirun.Result
@@ -22,7 +24,7 @@ from context import Compactor, ungrounded
 from lang import RULE, detect, t
 from pirun import short
 
-MAX_DEPTH = 3                      # 遞迴拆小的最深層數
+MAX_DEPTH = 1                      # 拆小最多一層：1.1 可以，1.1.x 不行（拆太深只會各自重查、重編檔名）
 STEP_ROUNDS = 14                   # 單步工具輪數上限（超過＝這步太大，拆小）
 STEP_CTX = 45000                   # 單步上下文 token 上限；超過就壓縮後接續（不算失敗）
 
@@ -39,6 +41,7 @@ MAX_CARRIES = 3                    # 同一步最多壓縮接續幾次，再不�
 MAX_STEPS = 7
 JOB_CAP = 10800                    # 整件工作的牆鐘安全網
 PROGRESS_EVERY = 900               # 超過這麼久還沒做完 → 每隔這麼久回報一次
+SEEN_CAP = 2000                    # 上一步工具輸出原文節錄帶給下一步的上限（字元）
 TRANSIENT = re.compile(r"ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|fetch failed|network|timed out|socket hang up|"
                        r"terminated|overloaded|\b50[0-9]\b|\b429\b|connection error", re.I)
 HUMAN_RE = re.compile(r"密碼|帳號|登入|授權|權限不足|需要你|請你|同意|要不要|哪一個|API ?key|token|付款|信用卡|驗證碼|2FA|拍板|由你決定")
@@ -51,13 +54,15 @@ PLANNER = (
     "- 每步附 done_when：怎樣算完成（可檢查的產物或輸出）。\n"
     "- 只做讀、查、整理、寫檔；對外寄信/發訊息/部署上線這類動作放最後一步，並標明「需使用者確認」。\n"
     "- 任務其實很單純（一兩步就好）就只給 1 步。不要把任務改成另一件事。\n"
+    "- 以「意圖」與「對話脈絡」為準：先把指代詞（重複的、cc、它、loop、那個）對回前文說的東西，再規劃；"
+    "不要把任務改成別件事（例如前文在說行程與信件，就不要變成整理腳本）。\n"
     "- 使用者若是在問你已經知道什麼、了解到哪裡，只給 1 步：用現有筆記回答，不要掃家目錄。\n"
     "- 不要規劃對家目錄或整台磁碟的 find、grep -r。要找檔案就用任務原文裡的那個專案目錄。\n"
     '只輸出 JSON：{"name":"任務短名（2–8 個字，像「發票整理」）","steps":[{"title":"…","done_when":"…"}]}'
 )
 DECOMPOSER = (
     "你是任務規劃器。下面這一步對助理來說太大或做不起來，請把它拆成 2–5 個更小、更具體的子步驟（每步 3–6 次工具呼叫內做得完），"
-    "並避開原本卡住的做法。不要改成掃描家目錄或整台磁碟。只輸出 JSON：" '{"steps":[{"title":"…","done_when":"…"}]}'
+    "並避開原本卡住的做法。子步驟要能直接做完，不會再往下拆。不要改成掃描家目錄或整台磁碟。只輸出 JSON：" '{"steps":[{"title":"…","done_when":"…"}]}'
 )
 REPLANNER = (
     "你是任務規劃器。使用者在任務進行中補充了新要求。請依新要求，重新規劃「還沒做的步驟」（已完成的不要動、不要重做）。"
@@ -69,40 +74,54 @@ VERIFIER = (
     '無法從回報確認產物是否存在時，以回報為準。只輸出 JSON：{"ok":true|false,"why":"一句話"}'
 )
 REPORTER = (
-    "你是使用者的助理，剛做完交代的一件事，現在要回報。像同事講話：自然、具體、不官腔，不要提內部機制（步驟、session、子任務等字眼）。\n"
+    "你是使用者的助理，剛做完交代的一件事，現在要回報。像同事講話：自然、具體、不官腔。"
+    "不要提內部字眼（步驟、清單、子任務、session、規劃）。\n"
     "規則：\n"
-    "1. 先逐項對照他原本問/要的每一件事，每一項都要明確回答到，不能漏；有問「有沒有問題」就直接說有或沒有。\n"
+    "1. 逐項對照他原本要的每一件事與「實際執行過的工具動作」：有對應動作的才算做了；"
+    "他的指示若找不到對應動作，就明說「這項沒做到」，不准把他的指示照抄成已完成。有問「有沒有問題」就直接說有或沒有。\n"
     "2. 要具體：檔名與完整路徑、行號、數字、指令、結果內容，不要只說「已完成」。\n"
-    "3. 沒做成的部分與原因要誠實說；需要他做的事（沒有就別提）放在最後一行。\n"
-    "4. Match the length to the task. Say what is true. Do not claim a file or a number you did not see.\n"
+    "3. 寄信、發訊息、刪檔這類動作，只有工具動作裡真的有才說做了；只產生草稿就說是草稿、還沒寄。\n"
+    "4. 沒做成的部分與原因要誠實說；需要他做的事（沒有就別提）放在最後一行。\n"
+    "5. Match the length to the task. Say what is true. Do not claim a file or a number you did not see.\n"
     + RULE
 )
 PLANNER += "\n" + RULE
 DECOMPOSER += "\n" + RULE
 REPLANNER += "\n" + RULE
 VERIFIER += "\n" + RULE
-STEP_PROMPT = """你正在完成一件較大的任務裡的「其中一步」。只做這一步，不要重做前面做過的事，也不要提前做後面的步驟。
-
-整體目標（原文，方向以此為準）：{goal}
-{ctx}{pins}計畫：
-{plan}
-目前累積的進度與關鍵事實：
-{prev}
-{extra}
-這一步：{title}
-完成標準：{done}
-
-對齊（這幾條優先於把事情做完的衝動）：
-- 只用上面的原文、進度，以及你這一步工具實際讀到的內容。沒出現過的路徑、主機、帳號、數字不要當成已知。
+ALIGN = """對齊（這幾條優先於把事情做完的衝動）：
+- 只用上面的原文、意圖、進度，以及你這一步工具實際讀到的內容。沒出現過的路徑、主機、帳號、數字不要當成已知。
+- 前面已經列過、讀過的（見「上一步工具輸出」）不要重做，直接用。
+- 沒在工具輸出裡出現過的檔名不得使用：要動哪個檔，先確定它真的出現在輸出裡，不要自己編或猜檔名。
 - 沒有做過的事不要說做完。沒看到的檔案與指令輸出不要編。
 - 回報裡的路徑與網址必須來自這一步的工具結果，或上面已經寫明的原文。
 - 這一步若已經偏離整體目標，停下來換做法，不要把任務做成別的事。
-- 可以多花幾步。不要空轉同一個指令。
+- 不要空轉同一個指令。
 - 不要對家目錄、/Users、/home 或整台磁碟做 find 或 grep -r。要搜就指定一個具體目錄。掃家目錄會被中止。
+- 不要對外寄信或發訊息：寄信只能用 gmail-send-safe 產生草稿，把草稿內容放進回報，等使用者在對話裡確認。
 
 做完用一到三行說明結果（含產出檔案的完整路徑）。真的做不到才開頭寫「被擋住：」並說明原因與你試過什麼；
-只有需要使用者提供資訊、授權或拍板時才寫「需要你：」。其他困難自己想辦法換做法。不要對外寄信或發訊息。
-""" + RULE
+只有需要使用者提供資訊、授權或拍板時才寫「需要你：」。其他困難自己想辦法換做法。
+"""
+STEP_PROMPT = """你正在完成一件較大的任務裡的「其中一步」。只做這一步，不要重做前面做過的事，也不要提前做後面的步驟。
+
+整體目標（原文，方向以此為準）：{goal}
+{intent}{ctx}{pins}計畫：
+{plan}
+目前累積的進度與關鍵事實：
+{prev}
+{seen}{extra}
+這一步：{title}
+完成標準：{done}
+
+""" + ALIGN + RULE
+CONTINUE_PROMPT = """剛才這件事做到一半被移到背景，請在這段對話裡接著做完。上面已經跑過的指令、讀過的檔案不要重做，直接用上面的結果往下。
+
+整體目標（原文，方向以此為準）：{goal}
+{intent}{pins}{extra}要做到：{title}
+完成標準：{done}
+
+""" + ALIGN + RULE
 
 
 class Cancelled(Exception):
@@ -144,6 +163,25 @@ def parse_steps(obj, prefix: str = "") -> list:
         if isinstance(s, dict) and str(s.get("title", "")).strip():
             steps.append(new_step(f"{prefix}{i}", s["title"], s.get("done_when", "")))
     return steps[:MAX_STEPS]
+
+
+def tool_digest(trace, cap: int = SEEN_CAP) -> str:
+    """一步的工具輸出原文節錄（檔案清單、路徑）：越後面越接近結果，超過 cap 就從前面捨。"""
+    blocks = [f"$ {t.get('action', '')}\n{t.get('out') or t.get('result') or ''}".rstrip() for t in (trace or [])
+              if t.get("out") or t.get("result")]
+    out, n = [], 0
+    for b in reversed(blocks):
+        if n + len(b) > cap:
+            if not out:
+                out.append(b[:cap - 1] + "…")
+            break
+        out.insert(0, b)
+        n += len(b) + 1
+    return "\n".join(out)
+
+
+def tool_acts(trace, n: int = 12) -> list:
+    return [short(t.get("action", ""), 100) for t in (trace or []) if t.get("action")][:n]
 
 
 def flat_progress(plan: list) -> tuple[int, int]:
@@ -212,7 +250,7 @@ class Orchestrator:
         timer = threading.Thread(target=self._progress_loop, args=(job, ctrl), daemon=True)
         try:
             if not job.get("plan"):
-                self._note(job, "這件要多做幾步，我先排一下步驟；你可以繼續聊別的，好了跟你說。", essential=True)
+                self._note(job, "這件比較花時間，我轉到背景接著做；你可以繼續聊別的，好了跟你說。", essential=True)
                 job["plan"] = self.make_plan(job, trace)
                 env.jobs.update(job, status="還在跑")
                 self.announce(job)
@@ -261,6 +299,8 @@ class Orchestrator:
         hint, reason, kind = "", "", ""
         for attempt in range(2):
             r = self.exec_step(job, steps, step, attempt, hint, ctrl)
+            if r.trace:                                    # 不管這次成不成，做過的動作都記下（回報要逐項對照）
+                step["acts"] = (step.get("acts") or []) + tool_acts(r.trace)
             if r.kind == "cancelled":
                 raise Cancelled()
             if r.kind == "final":
@@ -270,7 +310,8 @@ class Orchestrator:
                     blob = "\n".join([
                         job.get("goal") or "", step.get("title") or "", step.get("done_when") or "",
                         job.get("digest") or "", "\n".join(job.get("pins") or []),
-                        "\n".join(f"{t.get('action', '')} {t.get('result', '')} {t.get('paths', '')}" for t in (r.trace or [])),
+                        "\n".join(f"{t.get('action', '')} {t.get('result', '')} {t.get('paths', '')} {t.get('out', '')}" for t in (r.trace or [])),
+                        job.get("seen") or "",
                     ])
                     missing = ungrounded(r.text, blob)
                     if missing:
@@ -279,6 +320,8 @@ class Orchestrator:
                         ok, why = self.verify(step, r.text)
                         if ok:
                             step["status"], step["result"] = "done", short(r.text, 900)
+                            if r.trace:
+                                job["seen"] = tool_digest(r.trace)         # 下一步直接用，不再重列、重讀
                             job["digest"] = self.cx.roll_digest(job.get("digest", ""), step["title"], r.text)   # 遞迴壓縮進度摘要
                             jobs.update(job)
                             return True
@@ -315,16 +358,24 @@ class Orchestrator:
         lang = detect(job.get("goal") or "")
         pins = (t(lang, "pins", body="\n".join(f"- {x}" for x in job["pins"][-8:])) + "\n") if job.get("pins") else ""
         ctx = f"對話脈絡（只用來看懂目標裡簡短的說法）：\n{job['ctx']}\n" if job.get("ctx") else ""
-        base = dict(goal=short(job["goal"], 400), ctx=ctx, plan=self.plan_text(job["plan"], step["id"]), pins=pins,
-                    prev=job.get("digest") or "（還沒有）", title=step["title"], done=step["done_when"] or "（自行判斷合理的完成）")
+        intent = f"意圖（轉背景前你自己說要做的，指代詞以此為準）：\n{job['intent']}\n" if job.get("intent") else ""
+        seen = f"上一步工具輸出（原文節錄；檔名與路徑以此為準）：\n{job['seen']}\n" if job.get("seen") else ""
+        base = dict(goal=short(job["goal"], 400), ctx=ctx, intent=intent, plan=self.plan_text(job["plan"], step["id"]), pins=pins,
+                    prev=job.get("digest") or "（還沒有）", seen=seen, title=step["title"], done=step["done_when"] or "（自行判斷合理的完成）")
+        # 只有一步：不開新 session，沿用轉背景前的那個前景 session 接著做（前面列過、讀過的都還在）
+        reuse = job.get("sid") if len(job["plan"]) == 1 and step is job["plan"][0] else ""
         n, carries, carry = 0, 0, ""
         while True:
             remaining = JOB_CAP - (time.time() - job["started"])
             if remaining <= 0:
                 raise JobTimeout()
             ex = list(extra) + ([t(detect(job.get("goal") or ""), "carry", carry=carry)] if carry else [])
-            prompt = STEP_PROMPT.format(extra=("\n" + "\n".join(ex) + "\n") if ex else "", **base)
-            sid = f"job-{job['id']}-{step['id'].replace('.', '_')}-{attempt}" + (f"-r{n}" if n else "")
+            extra = ("\n" + "\n".join(ex) + "\n") if ex else ""
+            if reuse and not carry:                       # 壓縮接續（carry）就得開新的；其餘都接在前景 session 上
+                prompt, sid = CONTINUE_PROMPT.format(extra=extra, **base), reuse
+            else:
+                prompt = STEP_PROMPT.format(extra=extra, **base)
+                sid = f"job-{job['id']}-{step['id'].replace('.', '_')}-{attempt}" + (f"-r{n}" if n else "")
             r = env.run_pi(job, sid, prompt, ctrl.handle, STEP_ROUNDS, int(min(remaining, 3600)), _step_ctx(env))
             n += 1
             if r.kind == "error" and TRANSIENT.search(r.text) and not ctrl.cancelled:
@@ -362,8 +413,12 @@ class Orchestrator:
     def make_plan(self, job, trace):
         tr = "\n".join(f"- {t['action']} → {short(t['result'], 80)}" for t in (trace or [])[:6]) or "（無）"
         sup = "；".join(job.get("pins", [])) or "（無）"
-        ctx = f"對話脈絡（只用來看懂任務裡簡短的說法）：\n{job['ctx']}\n" if job.get("ctx") else ""
-        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n{ctx}已做過的前情：\n{tr}\n補充：{sup}", 600, tier="main")
+        ctx = f"對話脈絡（看懂任務裡簡短的說法與指代詞）：\n{job['ctx']}\n" if job.get("ctx") else ""
+        intent = f"意圖（轉背景前助理說要做的）：\n{job['intent']}\n" if job.get("intent") else ""
+        if trace and not job.get("seen"):
+            job["seen"] = tool_digest(trace)              # 前景已經列過、讀過的，第一步直接用
+            job["fg_acts"] = tool_acts(trace)
+        obj = self.env.llm_json(PLANNER, f"任務：{job['goal']}\n{intent}{ctx}已做過的前情：\n{tr}\n補充：{sup}", 600, tier="main")
         steps = parse_steps(obj)
         if not steps:                                     # 退階：規劃失敗 → 整件當一步交給遞迴機制去拆
             steps = [new_step("1", job["goal"], "任務完成並回報結果")]
@@ -438,7 +493,8 @@ class Orchestrator:
         text = env.llm_text(REPORTER, f"使用者原本交代的任務（原文）：{short(job['goal'], 800)}\n"
                                       + (f"對話脈絡（看懂任務用）：\n{job['ctx']}\n" if job.get("ctx") else "")
                                       + (f"之後補充/回答的要求：{'；'.join(job.get('pins', []))}\n" if job.get("pins") else "")
-                                      + f"各部分的做法與結果：\n{short(lines, 7000)}", 900, tier="main")
+                                      + f"各部分的做法與結果：\n{short(lines, 6000)}\n"
+                                      + f"實際執行過的工具動作（沒列在這裡的就是沒做）：\n{self.acts_text(job) or '（沒有）'}", 900, tier="main")
         if not text or len(text) < 5:
             text = lines                                  # 退階：報告員失效 → 直接給各步結果
         if done == 0:
@@ -483,6 +539,15 @@ class Orchestrator:
     def prev_text(plan):
         res = [f"- {s['title']}：{s['result']}" for s in plan if s["status"] == "done" and s["result"]]
         return "\n".join(res[-6:]) or "（還沒有）"
+
+    @staticmethod
+    def acts_text(job) -> str:
+        """轉背景前前景做的＋每一步（含沒成、拆小的）實際跑過的工具動作。"""
+        def walk(plan):
+            for s in plan:
+                yield from s.get("acts") or []
+                yield from walk(s["sub"])
+        return "\n".join(f"- {a}" for a in [*(job.get("fg_acts") or []), *walk(job.get("plan") or [])])[:2500]
 
     @staticmethod
     def result_lines(plan, depth=0):

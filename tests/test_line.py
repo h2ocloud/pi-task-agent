@@ -122,7 +122,7 @@ check("9 router: int→Telegram, 'line-…'→LINE (flag carried)", sent_tg == [
 c = FakeClient(); ch = L.LineChannel(c, tmp, tmp + "/m"); rt = L.Router(T2(), ch); ch.note_event("line-Uk", "RTK")
 rt.send("line-Uk", "『行事曆』進行中 1/3", essential=False, key="j1")
 check("10 LINE: keyed progress dropped, reply token kept", c.calls == [] and not ch.tokens["line-Uk"][2], c.calls)
-rt.send("line-Uk", "這件要多做幾步…", essential=True, key="j1")
+rt.send("line-Uk", "這件比較花時間，我轉到背景接著做…", essential=True, key="j1")
 check("10 LINE: keyed start (essential) goes out on the free reply token", c.calls and c.calls[-1][0] == "reply", c.calls)
 srv.httpd.shutdown()
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

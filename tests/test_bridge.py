@@ -58,9 +58,9 @@ check("3 failed send parked in outbox", os.path.exists(tmp + "/outbox.jsonl") an
 Flaky.up = True; t.flush_outbox(); time.sleep = real_sleep
 check("3 outbox flushed after network returns", t.log and t.log[-1]["text"] == "重要結果" and not os.path.exists(tmp + "/outbox.jsonl"), t.log)
 
-# 4 前景超過兩輪 → 轉背景（聊天空出來、session 換新、orchestrator 接手拿到前情 trace）
+# 4 前景到第 PROMOTE_AT 輪 → 轉背景（聊天空出來、session 換新、orchestrator 接手拿到前情 trace）
 def tool_ev(i): return ev(type="message_end", message={"role": "assistant", "content": [{"type": "toolCall", "name": "bash", "arguments": {"command": f"echo {i}"}}], "stopReason": "toolUse"})
-pi = fake("many", "for i in 1 2 3 4 5; do echo '" + "'\"$(echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo '$i'\"}}],\"stopReason\":\"toolUse\"}}')\"'" + "'; sleep 0.2; done; sleep 30")
+pi = fake("many", "for i in 1 2 3 4 5 6 7; do echo '" + "'\"$(echo '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"toolCall\",\"name\":\"bash\",\"arguments\":{\"command\":\"echo '$i'\"}}],\"stopReason\":\"toolUse\"}}')\"'" + "'; sleep 0.2; done; sleep 30")
 br, tg = mk(pi); started = {}
 class FakeOrch:
     def __init__(s): s.calls = []
@@ -335,4 +335,80 @@ tk.send(1, "別的回覆"); tk.send(1, "進度 2/3", key="j")
 check("11j once buried under another message, progress becomes a fresh message", [m for m, *_ in tk.log][-2:] == ["sendMessage", "sendMessage"] and tk.keyed[(1, "j")] == 103, tk.log)
 tk.send(1, "進度 3/3", key="j")
 check("11j ...and later progress edits that newest one", tk.log[-1][0] == "editMessageText" and tk.log[-1][2] == 103, tk.log)
+# 12 opt5：查詢類在前景答完（PROMOTE_AT=6）、轉背景帶意圖與前文、寄信硬擋
+import mailgate as M, subprocess, pirun as P
+def rounds_pi(name, n, tail):
+    say = "我先看明天的行事曆"
+    one = ev(type="message_end", message={"role": "assistant", "stopReason": "toolUse", "content": [
+        {"type": "text", "text": say}, {"type": "toolCall", "name": "bash", "arguments": {"command": "gog calendar events --tomorrow #N"}}]})
+    return fake(name, "for i in " + " ".join(str(i) for i in range(1, n + 1)) + "; do echo '" + one.replace("#N", "'$i'") + "'; sleep 0.05; done; " + tail)
+class FakeOrch2:
+    def __init__(s): s.calls = []
+    def start(s, job, trace=None, resumed=False): s.calls.append((job, trace))
+    def describe(s, j): return "規劃中"
+    def get(s, i): return None
+br, tg = mk(rounds_pi("five", 5, f"echo '{final_ev('明天有三個行程')}'")); br.orch = FakeOrch2()
+br.llm_text = lambda *a, **k: '{"say":"我先看明天的行事曆。","work":true,"know":false}'
+br.foreground(1, 1, "owner", "明天行事曆", [], 31)
+check("12a calendar query with 5 tool rounds is answered in the foreground (PROMOTE_AT=6, no background job)",
+      B.PROMOTE_AT == 6 and br.orch.calls == [] and tg.sent[-1][1] == "明天有三個行程", (tg.sent, br.orch.calls))
+br, tg = mk(rounds_pi("seven", 7, "sleep 30")); br.orch = FakeOrch2()
+br.convo.add(1, "u", "Costco 行程有兩筆重複，那封信也寄了兩次"); br.convo.add(1, "a", "我看到兩筆 Costco 行程。")
+br.llm_text = lambda *a, **k: '{"say":"我先看 Costco 那兩筆行程。","work":true,"know":false}'
+br.convo.add(1, "u", "刪除重複的，cc 改 loop 進行程")
+br.foreground(1, 1, "owner", "刪除重複的，cc 改 loop 進行程", [], 32)
+job = br.orch.calls[0][0] if br.orch.calls else {}
+check("12b round 6 promotes; job carries intent (opener + model's last words) and recent turns for references",
+      len(br.orch.calls) == 1 and "我先看 Costco 那兩筆行程" in job.get("intent", "") and "我先看明天的行事曆" in job.get("intent", "")
+      and "Costco 行程有兩筆重複" in job.get("ctx", "") and len(br.orch.calls[0][1]) >= 5, (job, tg.sent))
+
+os.environ["PITG_HOME"] = tmp                                     # pitg-mail 跟橋接層看同一個 state/mail
+maild = os.path.join(B.STATE_DIR, "mail"); gl = tmp + "/gog.log"
+os.environ["PITG_REAL_GOG"] = fake("gog", f'echo "$@" >> {gl}; echo \'{{"id":"m1"}}\'')
+d = M.new_draft("sammi@example.com", "Costco 行程", "Hi\\n明天見", cc="h@example.com", d=maild)
+ok, msg = M.send(d["id"], d=maild)
+rc = subprocess.run([sys.executable, os.path.join(os.path.dirname(B.__file__), "mailgate.py"), "send", "--confirmed", d["id"]], capture_output=True, text=True)
+check("12c no confirmation in chat → --confirmed alone does not send (gog never called)",
+      not ok and "沒寄" in msg and rc.returncode == 3 and "沒寄" in rc.stdout and not os.path.exists(gl) and d["body"] == "Hi\n明天見", (msg, rc.stdout, rc.returncode))
+out = subprocess.run([sys.executable, os.path.join(os.path.dirname(B.__file__), "mailgate.py"), "draft", "--to", "x@example.com", "--subject", "s", "--body", "b"],
+                     capture_output=True, text=True).stdout
+check("12d draft prints the whole draft and how to send after confirmation, sends nothing", "還沒寄" in out and "--confirmed" in out and not os.path.exists(gl), out)
+
+import shutil; shutil.rmtree(maild)                                 # 上面兩份是單元測試用的，這段從乾淨的草稿夾開始
+br, tg = mk(fake("noop", "exit 0")); seen = []
+br.foreground = lambda chat_id, uid, mode, text, *a, **k: seen.append(text)
+br.convo.add(1, "u", "幫我寫信跟 Sammi 說明天 Costco 的事"); time.sleep(0.02)
+d2 = M.new_draft("sammi@example.com", "Costco", "明天十點", d=maild); time.sleep(0.02)
+br.process_message(1, 1, "owner", "不要寄出", [], 41)
+check("12e a negative ('不要寄出') approves nothing", not M._load(maild, d2["id"])["approved"] and "確認寄出草稿" not in seen[-1], seen)
+br.process_message(1, 1, "owner", "時間改成十一點", [], 42); time.sleep(0.02)
+d3 = M.new_draft("sammi@example.com", "Costco", "明天十一點見", d=maild); time.sleep(0.02)
+br.process_message(1, 1, "owner", "看起來不錯", [], 43); time.sleep(0.02)
+br.process_message(1, 1, "owner", "好，寄出", [], 44)
+check("12f '好，寄出' (even one message later) approves the revised draft only, and tells the model its id",
+      M._load(maild, d3["id"])["approved"] and not M._load(maild, d2["id"])["approved"] and d3["id"] in seen[-1] and d2["id"] not in seen[-1]
+      and "--confirmed" in seen[-1], (seen[-1], M._load(maild, d2["id"])))
+ok1, m1 = M.send(d3["id"], d=maild); ok2, m2 = M.send(d3["id"], d=maild)
+sent = open(gl).read() if os.path.exists(gl) else ""
+check("12h confirmed draft is sent once, verbatim recipients; a second send is refused",
+      ok1 and "已寄出" in m1 and not ok2 and "寄過" in m2 and sent.count("send ") == 1 and "--to sammi@example.com" in sent, (m1, m2, sent))
+M._save(maild, dict(M._load(maild, d2["id"]), sent=time.time()))       # 舊稿另外處理掉，只剩寄過的
+br.process_message(1, 1, "owner", "寄出", [], 45)
+check("12i sent drafts are never re-approved", "確認寄出草稿" not in seen[-1], seen[-1])
+d4 = M.new_draft("x@example.com", "s", "b", d=maild); dr = M._load(maild, d4["id"]); dr["approved"] = dr["created"] + 1; dr["created"] -= 4000; dr["approved"] -= 4000; M._save(maild, dr)
+check("12j an approval older than 30 minutes no longer sends", not M.send(d4["id"], d=maild)[0])
+
+guard = os.path.join(os.path.dirname(B.__file__), "tools", "gog-guard"); open(gl, "w").close()
+blocked = [subprocess.run(["bash", guard] + a, capture_output=True, text=True) for a in (["send", "--to", "x"], ["gmail", "send", "--to", "x"], ["gmail", "drafts", "send", "d"], ["--gmail-no-send=false", "send"],
+                                                                                  ["calendar", "create", "primary", "--send-updates=all"], ["calendar", "update", "p", "e", "--send-updates", "externalOnly"])]
+passed = subprocess.run(["bash", guard, "-a", "acct", "send", "--to", "x"], capture_output=True, text=True)
+cal = subprocess.run(["bash", guard, "calendar", "events", "--tomorrow"], capture_output=True, text=True)
+calls = open(gl).read()
+check("12k gog guard: direct sends / invite mails never reach gog; anything else always carries --gmail-no-send",
+      all(r.returncode == 3 and ("pitg-mail" in r.stderr or "--send-updates=none" in r.stderr) for r in blocked) and calls.count("--gmail-no-send") == 2
+      and "--gmail-no-send -a acct send" in calls and "--gmail-no-send calendar events --tomorrow" in calls, (calls, [r.stderr[:40] for r in blocked]))
+pp = fake("pathpi", f'echo "$PATH" > {tmp}/path.txt; echo \'{final_ev("ok")}\'')
+P.run(P.Spec(pp, "x", "m", "sidp", "hi", tmp, tmp), P.Handle())
+check("12l pi tools get /usr/sbin and /sbin (md5 lives in /sbin)", {"/sbin", "/usr/sbin"} <= set(open(tmp + "/path.txt").read().strip().split(":")))
+
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)

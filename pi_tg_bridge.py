@@ -26,6 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+import mailgate
 import pirun
 from context import Compactor
 from convo import ConvoLog, Debouncer
@@ -46,9 +47,9 @@ SKILLS_DIR = DATA + "/skills"
 CHAT_CWD = DATA + "/chat"          # 唯讀聊天模式的空工作目錄（不載入 AGENTS.md）
 
 COMPACT_AT = int(os.environ.get("PITG_COMPACT_AT", "40000"))     # 聊天 session 上下文超過這麼多 token → 自動壓縮
-PROMOTE_AT = 3                     # 第 3 輪工具開始＝超過兩輪 → 交給 orchestrator 當背景工作
+PROMOTE_AT = 6                     # 第 6 輪工具開始 → 交給 orchestrator 當背景工作（查詢類通常幾輪內就在前景答完）
 MAX_RUNS = int(os.environ.get("PITG_MAX_RUNS", "4"))                # 同時跑的 pi 數（後端單序列，更多只會互相拖慢）
-FG_WALL = int(os.environ.get("PITG_FG_WALL", "600"))                # 前景一則在到達第 3 輪前的牆鐘上限（超過一樣轉背景，不砍）
+FG_WALL = int(os.environ.get("PITG_FG_WALL", "600"))                # 前景一則在到達 PROMOTE_AT 輪前的牆鐘上限（超過一樣轉背景，不砍）
 TOOL_STALL = int(os.environ.get("PITG_TOOL_STALL", "180"))
 RETRY_WAITS = (15, 30, 60)         # 暫時性錯誤的重試間隔
 SESSION_MAX_BYTES = 2_000_000      # session 檔過大就自動開新的（本地模型 context 有限）
@@ -86,6 +87,10 @@ STOP_SHORT = re.compile(r"\s*(停|停下|停一下|先不用|不用了|stop|canc
 KNOW_RE = re.compile(r"了解到哪|了解多少|知道多少|知道些什麼|你對.{0,40}了解|你認識|認不認識")
 # 要「做事」的請求一律交主模型（行事曆／提醒／信件／檔案／設定／多步長任務）
 ACTION_RE = re.compile(r"行事曆|日曆|行程|會議|排程|卡.{0,6}(時間|行事曆)|提醒|鬧鐘|待辦|寄|回信|信件|email|mail|郵件|邀請|檔案|文件|資料夾|上傳|下載|設定|安裝|部署|重啟|修|改|建立|新增|刪除|整理|查一下|幫我|幫忙|執行|跑|calendar|schedule|remind|meeting|file|install|deploy|setup|configure|run |create|delete|update|fix", re.I)
+# 他在對話裡確認寄出（只有這句會核可草稿；有否定、修改、疑問就不算）
+MAIL_OK_RE = re.compile(r"寄出|送出|發送|寄吧|送吧|就寄|直接寄|可以寄|確認寄|確定寄|send it|go ahead|"
+                        r"^\s*(好|ok|可以|確認|沒問題)?[，,\s]*(寄|送|發)(吧|囉|喔|了)?[!！。.~～\s]*$", re.I)
+MAIL_NO_RE = re.compile(r"不|別|沒有|還沒|等等|等一下|改|修|換|再|嗎|[？?]|don't|not|wait", re.I)
 # 小模型說「做不到」→ 不准自己回，強制交主模型
 CANT_RE = re.compile(r"做不到|無法|沒辦法|不能幫|沒有權限|無權|不支援|can't|cannot|unable|not able|don't have access", re.I)
 _MODEL_RE = re.compile(r"你是什麼模型|你是哪個模型|什麼模型|which model|what model", re.I)
@@ -1026,12 +1031,32 @@ class Bridge:
                 self.convo.add(chat_id, "u", text)
             with self.mu:
                 self.last_sent.pop(chat_id, None)                     # 他又問了一次 → 同樣的答案也要再給
+            if mode == "owner":
+                text = self.confirm_mail(chat_id, text)
             if mode == "owner" and self.route(chat_id, text, files, msg_id):
                 return
             self.foreground(chat_id, uid, mode, text, files, msg_id)
         except Exception:
             log.exception("process_message failed")
             self.send(chat_id, "（我這邊出了點狀況，這則沒處理成，請再傳一次）", msg_id)
+
+    def confirm_mail(self, chat_id, text: str) -> str:
+        """他在對話裡說「寄出」→ 核可草稿（只有這裡做得到），並提醒主模型用 --confirmed 寄原文。
+        核可的是最新那份草稿出來之前、他最後一則訊息之後出的草稿：同一輪出的都算，他要求修改之前的舊稿不算。"""
+        if len(text) > 30 or not MAIL_OK_RE.search(text) or MAIL_NO_RE.search(text):
+            return text
+        d = os.path.join(STATE_DIR, "mail")
+        drafts = mailgate.pending(d=d)
+        if not drafts:
+            return text
+        newest = drafts[-1]["created"]
+        asked = [r["ts"] for r in self.convo.recent(chat_id, self.convo.keep) if r["who"] == "u" and r["ts"] < newest]
+        since = max(asked) if asked else (drafts[-2]["created"] if len(drafts) > 1 else 0)     # 前文沒有他的訊息 → 只核可最新那份
+        ids = mailgate.approve_pending(since, d=d)
+        if not ids:
+            return text
+        log.info("mail: %d draft(s) approved in chat", len(ids))
+        return text + f"\n（系統：使用者剛在對話中確認寄出草稿 {'、'.join(ids)}。用 pitg-mail send --confirmed <id> 寄出，不要改內容。）"
 
     def route(self, chat_id: int, text: str, files: list, msg_id) -> bool:
         """有事在跑（前景這一則或背景工作）或在等他回答時，先判斷這則是誰的。回 True＝已處理。
@@ -1215,7 +1240,7 @@ class Bridge:
     def foreground(self, chat_id, uid, mode, text, files, msg_id, opener=True):
         """小模型先說話（不排隊，長工作進行中也即時回）；要動手的才開 pi。
         主 session 空著就用主 session；正在用 → 這則開平行 session（帶最近對話），不回「前一件還在處理」。"""
-        know = False
+        know, say = False, ""
         if mode == "owner" and opener:
             say, work, know = self.first_words(text, self._endpoint("main"), chat_id)
             if say:
@@ -1225,15 +1250,16 @@ class Bridge:
         lock = self.chat_locks.setdefault(chat_id, threading.Lock())     # 主 session 檔一次只給一則用
         side = not lock.acquire(blocking=False)
         try:
-            extras = self._turn(chat_id, uid, mode, text, files, msg_id, know, side)
+            extras = self._turn(chat_id, uid, mode, text, files, msg_id, know, side, say)
         finally:
             if not side:
                 lock.release()
         if extras:                                                       # 做的時候他補充的話：接著在主 session 處理
             self.foreground(chat_id, uid, mode, "補充（接著剛才那件）：\n" + "\n".join(extras), [], None, opener=False)
 
-    def _turn(self, chat_id, uid, mode, text, files, msg_id, know, side) -> list:
-        """跑一則前景。回傳做的時候他補充、還沒處理的話（被停掉、轉背景或失敗就是空的）。"""
+    def _turn(self, chat_id, uid, mode, text, files, msg_id, know, side, opener: str = "") -> list:
+        """跑一則前景。回傳做的時候他補充、還沒處理的話（被停掉、轉背景或失敗就是空的）。
+        opener＝快速模型的開場白；轉背景時它跟主模型最後說的話一起當「意圖」交給 orchestrator。"""
         sid = f"side-{chat_id}-{uuid.uuid4().hex[:6]}" if side else self.pick_sid(chat_id)
         prompt = self.build_prompt(chat_id, mode, text, side)
         if know:
@@ -1244,9 +1270,11 @@ class Bridge:
         handle, stop = pirun.Handle(), threading.Event()
         first = re.split(r"[，。,.；;：:！!？?\n]", re.sub(r"[「」『』]", "", text).strip())[0]
         work = {"label": short(first, 14).rstrip("…") or "這則", "text": text, "started": time.time(),
-                "handle": handle, "extras": [], "side": side, "job": None}
+                "handle": handle, "extras": [], "side": side, "job": None, "opener": opener, "said": ""}
 
         def on_round(said, calls, n):
+            if (said or "").strip():
+                work["said"] = said.strip()                                # 主模型最後一段自己的話（轉背景時當意圖）
             if n >= PROMOTE_AT and mode == "owner":
                 return "abort"
 
@@ -1340,10 +1368,9 @@ class Bridge:
         first = re.split(r"[，。,.；;：:！!？?\n]", re.sub(r"[「」『』]", "", text).strip())[0]
         name = short(first, 10).rstrip("…") or "任務"                         # 暫名；規劃完成後由模型取短名取代
         job = self.jobs.add(chat_id, name, text, sid)
-        if len(text) <= 30:                                                # 短句（「那明天呢」）單看不懂：附最近對話給規劃與每一步
-            ctx = self.convo.render(self.convo.recent(chat_id, 6, skip=text), 200)
-            if ctx:
-                self.jobs.update(job, ctx=ctx)
+        ctx = self.convo.render(self.convo.recent(chat_id, 6, skip=text), 200)    # 指代詞（重複的、cc、那明天呢）要靠前文
+        intent = "\n".join(x for x in ((work or {}).get("opener"), (work or {}).get("said")) if x)
+        self.jobs.update(job, **({"ctx": ctx} if ctx else {}), **({"intent": short(intent, 600)} if intent else {}))
         if not (work and work["side"]):
             self.state.new_session(chat_id)                                # 前景聊天換新 session，舊的留給這件工作的前情
         if work:
