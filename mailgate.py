@@ -21,8 +21,10 @@ import uuid
 
 APPROVE_TTL = 1800                 # 核可後多久內要寄出
 DRAFT_TTL = 1800                   # 只核可這麼久以內的草稿
-ACCOUNT = "h2ocloud6328@gmail.com"
-CLIENT = "h2ocloud6328"
+# 寄件帳號／client 從環境變數讀（公開 repo 不寫死個人帳號）。
+# 由 bridge 從 ~/.config/pi-tg-bridge/env 匯出給子行程；也可直接設 GMAIL_ACCOUNT／GMAIL_CLIENT 或用 --account／--client。
+ACCOUNT = os.environ.get("GMAIL_ACCOUNT", "")
+CLIENT = os.environ.get("GMAIL_CLIENT", "")
 
 
 def root() -> str:

@@ -1559,6 +1559,9 @@ def main():
     for k in ("BOT_TOKEN", "OWNER_ID"):
         if not env.get(k):
             sys.exit(f"missing {k} in {CFG_DIR}/env")
+    for k in ("GMAIL_ACCOUNT", "GMAIL_CLIENT"):     # 讓模型另起的 pitg-mail 子行程讀得到寄件帳號
+        if env.get(k):
+            os.environ[k] = env[k]
     tg = Telegram(env["BOT_TOKEN"], STATE_DIR + "/outbox.jsonl")
     line_ch = hook = None
     if env.get("LINE_CHANNEL_ACCESS_TOKEN") and env.get("LINE_CHANNEL_SECRET"):
