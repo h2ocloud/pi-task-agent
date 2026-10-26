@@ -594,9 +594,12 @@ class Bridge:
             who = f"ChatGPT, model id {ep.get('model')}"
         else:
             who = f"the local model, id {ep.get('model') or self.state.alias()}"
+        wd = "一二三四五六日"[time.localtime().tm_wday]
         return (
             f"This turn's model: {who}. "
             "If asked which model you are, answer with this id. Do not claim a different model.\n"
+            f"現在時間：{time.strftime('%Y-%m-%d %H:%M')}（週{wd}），本地時區。"
+            "回答日期、星期、今天/明天/本週這類問題時以此為準，不要自己猜；需要精確值再用工具確認。\n"
         )
 
     def _provider_line(self, chat_id) -> str:

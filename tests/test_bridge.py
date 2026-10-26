@@ -431,4 +431,10 @@ tgL = TG(); brL = B.Bridge(tgL, {"OWNER_ID": "1", "LINE_OWNER_ID": "Uowner", "PI
 brL.handle_line_event({"type": "message", "source": {"type": "user", "userId": "Uowner"}, "message": {"type": "sticker", "packageId": "1", "stickerId": "2"}})
 check("13c LINE unsupported type → graceful text, nothing run", len(tgL.sent) == 1 and "看得懂文字" in tgL.sent[-1][1], tgL.sent)
 
+# 13d 每輪 note 注入當前日期＋星期（弱模型沒工具就不會幻想日期；live 回歸抓到 B2/B3 幻想）
+br, tg = mk(fake("ok13d", f"echo '{final_ev('x')}'"))
+note = br.turn_model_note({"provider": "local", "model": "spark-main"})
+wd = "一二三四五六日"[time.localtime().tm_wday]
+check("13d turn note injects today's date and weekday", time.strftime("%Y-%m-%d") in note and f"週{wd}" in note, note)
+
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)
