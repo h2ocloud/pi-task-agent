@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import collections
+import difflib
 import fcntl
 import glob
 import json
@@ -211,6 +212,8 @@ HELP_TEXT = (
     "/skills  可用 skills\n"
     "/help  這份清單"
 )
+KNOWN_CMDS = ("/help", "/start", "/commands", "/new", "/reset", "/compact", "/status", "/jobs",
+              "/model", "/provider", "/thinking", "/think", "/stop", "/resume", "/skills")
 
 log = logging.getLogger("pi-tg")
 
@@ -862,7 +865,8 @@ class Bridge:
             return self.resume(chat_id, arg)
         if cmd == "/skills":
             return format_list(SKILLS_DIR)
-        return f"未知指令 '{cmd}'。\n" + HELP_TEXT
+        near = difflib.get_close_matches(cmd, KNOWN_CMDS, n=1, cutoff=0.5)
+        return f"未知指令 '{cmd}'。" + (f"你是不是要用 {near[0]}？\n" if near else "\n") + HELP_TEXT
 
     def stop(self, chat_id: int, name: str) -> str:
         act, fg = self.jobs.of(chat_id, ACTIVE), self.inflight(chat_id)

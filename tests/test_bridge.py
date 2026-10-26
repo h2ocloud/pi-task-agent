@@ -411,4 +411,24 @@ pp = fake("pathpi", f'echo "$PATH" > {tmp}/path.txt; echo \'{final_ev("ok")}\'')
 P.run(P.Spec(pp, "x", "m", "sidp", "hi", tmp, tmp), P.Handle())
 check("12l pi tools get /usr/sbin and /sbin (md5 lives in /sbin)", {"/sbin", "/usr/sbin"} <= set(open(tmp + "/path.txt").read().strip().split(":")))
 
+# 13 弱模型／指令穩定度缺口（本次壓測補）
+# 13a 小模型自稱「做不到」→ 強制交主模型，罐頭拒絕句丟掉
+br, tg = mk(fake("ok13", f"echo '{final_ev('done')}'"))
+br.llm_text = lambda *a, **k: '{"say":"這個我做不到，我沒有權限。","work":false,"know":false}'
+say, work, _ = br.first_words("幫我把這份報告整理成三點", {"provider": "local", "model": "spark-main"})
+check("13a weak model's 做不到 is overridden → main model works, canned refusal dropped", work and say == "", (say, work))
+
+# 13b 未知／打錯的 slash：建議最接近的指令並附清單；差太遠就只給清單
+br, tg = mk(fake("ok13b", f"echo '{final_ev('x')}'"))
+r1, r2, r3 = br.command("/jbos", 1, 1, True), br.command("/stauts", 1, 1, True), br.command("/zzzzz", 1, 1, True)
+check("13b unknown slash suggests the closest command; a far-off one just shows help",
+      "你是不是要用 /jobs" in r1 and "你是不是要用 /status" in r2 and "你是不是要用" not in r3 and B.HELP_TEXT in r3, (r1[:30], r2[:30], r3[:20]))
+
+# 13c LINE 不支援的訊息類型（貼圖/位置…）→ 一句說明，不派送處理
+tgL = TG(); brL = B.Bridge(tgL, {"OWNER_ID": "1", "LINE_OWNER_ID": "Uowner", "PI_BIN": fake("ok13c", f"echo '{final_ev('x')}'"),
+                                 "SPARK_ENV": "/dev/null", "PITG_GROK_SESSION": "0"},
+                           B.State(B.STATE_DIR + f"/sL{time.time()}.json"), B.Jobs(B.STATE_DIR + f"/jL{time.time()}.json"))
+brL.handle_line_event({"type": "message", "source": {"type": "user", "userId": "Uowner"}, "message": {"type": "sticker", "packageId": "1", "stickerId": "2"}})
+check("13c LINE unsupported type → graceful text, nothing run", len(tgL.sent) == 1 and "看得懂文字" in tgL.sent[-1][1], tgL.sent)
+
 print("\nRESULT:", "ALL PASS" if not fails else f"FAILED {fails}"); sys.exit(1 if fails else 0)
